@@ -4,7 +4,7 @@
 
 Splicer does a few things and does them properly. It doesn't try to replace a full editor — it's built for the workflow of *straighten → crop → export at exactly the file size you need*, with a real photo library underneath.
 
-![Splicer](https://img.shields.io/badge/version-2.1.0-f3c34f) ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-1c1f26)
+![Splicer](https://img.shields.io/badge/version-2.1.1-f3c34f) ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-1c1f26)
 
 ---
 

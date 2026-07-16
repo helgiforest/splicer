@@ -1,179 +1,101 @@
-# Meridian — фоторедактор (десктопное приложение)
+# Meridian
 
-## Публикация на GitHub (установщики для Windows / macOS / Linux)
+**A focused photo tool: library, precision crop, automatic horizon leveling, and size-targeted export.**
 
-В репозиторий заливается **исходный код** (exe/dmg не коммитятся — их
-собирает GitHub Actions и прикладывает к релизу):
+Meridian does a few things and does them properly. It doesn't try to replace a full editor — it's built for the workflow of *straighten → crop → export at exactly the file size you need*, with a real photo library underneath.
 
-```bash
-# в папке проекта, один раз
-git init
-git add .
-git commit -m "Meridian 2.0"
-git branch -M main
-git remote add origin https://github.com/ВАШ_ЛОГИН/meridian.git
-git push -u origin main
-
-# выпуск релиза: создаёт тег → Actions собирает установщики для 3 ОС
-git tag v2.0.1
-git push origin v2.0.1
-```
-
-Через ~10 минут на странице **Releases** репозитория появятся
-`Meridian Setup X.exe`, `Meridian-X.dmg` и `Meridian-X.AppImage` —
-люди просто скачивают файл под свою систему. Приложение не подписано
-сертификатом, поэтому при первом запуске: macOS — правый клик → Open,
-Windows — SmartScreen «Подробнее → Выполнить в любом случае».
-
-Быстрая установка на свой Mac без ожидания Actions:
-`git clone …` → `npm install` → `npm run dist` → в `release/` будет dmg.
-
-
-Библиотека фотографий + кроп + автоматическое выравнивание горизонта + экспорт
-с заданием максимального размера файла в мегабайтах.
-
-Работает на macOS, Windows и Linux (Electron). Библиотека сохраняется между
-запусками, приложение видит реальные папки на диске.
+![Meridian](https://img.shields.io/badge/version-2.0.3-f3c34f) ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-1c1f26)
 
 ---
 
-## 1. Что нужно установить (один раз)
+## Features
 
-**Node.js** версии 18 или новее: https://nodejs.org (кнопка LTS).
-Проверить, что установилось: откройте терминал и выполните `node -v`.
+- **Photo library** that mirrors your real folders — import a folder once and it stays in sync with the disk automatically. Originals are **never modified**; every edit is non-destructive and reversible.
+- **Precision crop**: aspect presets (1:1, 3:2, 4:3, 16:9, 4:5, 9:16…), rule-of-thirds grid, ±45° rotation with auto-fill, hand tool, canvas zoom, full undo history (Ctrl+Z).
+- **Auto horizon leveling** built on line detection (Hough transform ranked by line length) — one click, with alternative suggestions if the first guess is off, and a batch mode for whole selections.
+- **Size-targeted export**: type "9 MB" and Meridian binary-searches the encoder to land just under it. Powered by **MozJPEG** (best-in-class quality per byte) and high-effort WebP, with a live size estimate before you save.
+- **Export presets**: save "Telegram · ≤2 MB · JPEG → D:\Out" once, then right-click any photos → one click and they're compressed and delivered to that folder. Filename templates (`{name}`, `{date}`) and optional EXIF carry-over included.
+- **Big-file ready**: a proxy pyramid keeps 200-megapixel files panning and zooming as smoothly as phone photos, with on-demand full-resolution tiles when you zoom in.
+- **Wide format support**: JPEG, PNG, WebP, GIF, AVIF, BMP, TIFF, HEIC/HEIF and camera RAW (CR2, CR3, NEF, ARW, ORF, RW2, RAF, DNG, PEF and more).
+- Star ratings with keyboard shortcuts and library filtering, EXIF panel (camera, lens, ISO, shutter, aperture), dark & light themes.
 
-## 2. Первый запуск
+Everything runs **100% locally**. No accounts, no cloud, no telemetry — your photos never leave your computer.
 
-Откройте терминал в папке проекта и выполните:
+---
 
+## Download & install
+
+Grab the file for your system from the **[latest release](../../releases/latest)**.
+
+| System | File | Notes |
+|---|---|---|
+| **Windows 10/11** | `Meridian Setup X.X.X.exe` | Regular installer |
+| **macOS — Apple Silicon** (M1–M4) | `Meridian-X.X.X-arm64.dmg` | Check your chip:  → About This Mac |
+| **macOS — Intel** | `Meridian-X.X.X-x64.dmg` | |
+| **Linux** | `Meridian-X.X.X.AppImage` | No installation needed |
+
+The app is not code-signed with a paid certificate, so each OS shows a one-time warning on first launch. This is expected — here's how to get past it:
+
+### Windows
+1. Run the `.exe`. If **SmartScreen** appears ("Windows protected your PC"): click **More info → Run anyway**.
+2. Follow the installer. Launch Meridian from the Start menu.
+
+### macOS
+1. Open the `.dmg` and drag **Meridian** into **Applications**.
+2. First launch: **right-click the app → Open → Open** (a plain double-click will be blocked once).
+3. If macOS says the app *"is damaged and can't be opened"* — it isn't damaged, it's the quarantine flag on unsigned downloads. Open **Terminal** and run:
+   ```
+   xattr -cr /Applications/Meridian.app
+   ```
+   then launch normally.
+
+### Linux
 ```bash
-npm install     # скачает зависимости (несколько минут, только в первый раз)
-npm start       # соберёт интерфейс и откроет приложение
+chmod +x Meridian-*.AppImage
+./Meridian-*.AppImage
 ```
+If it complains about FUSE: `sudo apt install libfuse2`.
 
-Готово — приложение откроется как обычная программа в своём окне.
+---
 
-## 3. Сборка установщика (.dmg / .exe / .AppImage)
+## Quick start
 
-Чтобы получить файл, который ставится как обычная программа:
+1. **Import folder** — pick a folder of photos; it appears in the sidebar and stays in sync with the disk (add/remove files in Explorer/Finder and the library follows).
+2. Click a photo → it opens in the **viewer**. Press **Crop** (or `Enter`) for the tools.
+3. Hit **Auto level**, fine-tune with the slider or the suggested alternatives, adjust the frame, press **Done** (`Enter`).
+4. **Export** → set the max size in MB, watch the live estimate, save. Or create a **preset** and from then on just right-click photos → one click.
 
-```bash
-npm run dist
-```
+### Keyboard shortcuts
 
-Установщик появится в папке `release/`:
-
-| Где запускаете команду | Что получите |
+| Key | Action |
 |---|---|
-| macOS   | `Meridian-1.0.0.dmg` — открыть и перетащить в Applications |
-| Windows | `Meridian Setup 1.0.0.exe` — обычный установщик |
-| Linux   | `Meridian-1.0.0.AppImage` — сделать исполняемым и запустить |
+| `Enter` | Open crop tools / apply crop |
+| `Esc` | Apply & return to library |
+| `←` `→` | Previous / next photo |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo crop steps |
+| `1`–`5`, `0` | Rate photo / clear rating |
+| Mouse wheel | Zoom the canvas |
+| Drag empty space | Pan · double-click to recenter |
+| `Ctrl+Click`, `Shift+Click` | Select photos / select a range |
 
-**Важно:** установщик для каждой ОС собирается на этой же ОС. То есть `.dmg`
-собирается на маке, `.exe` — на Windows, `.AppImage` — на Linux. Один раз
-собрали — дальше пользуетесь установленным приложением, терминал больше не нужен.
+### Good to know
 
-### Предупреждения системы при первом запуске
+- **Removing photos or folders from the library never deletes files from disk** — and there's an Undo button in the toast just in case.
+- Deep-zoomed view sharpens to true 1:1 pixels a moment after you stop zooming — that's the tile engine catching up with the proxy.
+- If the export estimate says *"Maximum quality reached"*, your size limit is generous: quality 100 is already smaller than the limit, and extra bytes wouldn't add detail.
 
-Приложение не подписано сертификатом разработчика, поэтому:
+---
 
-- **macOS**: если Gatekeeper блокирует запуск — кликните по приложению правой
-  кнопкой → «Открыть» → «Открыть» (нужно один раз).
-- **Windows**: если появится SmartScreen — «Подробнее» → «Выполнить в любом случае».
-- **Linux**: `chmod +x Meridian-1.0.0.AppImage`, затем запустить.
+## Building from source
 
-## Что нового в 1.6
+Requires [Node.js](https://nodejs.org) 18+.
 
-- Резкость: фото всегда чёткое сразу при открытии, независимо от формата
-  и зума (исправлен кэш низкого разрешения, из-за которого картинка была
-  мутной до первого скролла).
-- Массовое выделение: Ctrl+клик выделяет отдельные фото, Shift+клик —
-  диапазон (в ленте Shift теперь считает диапазон от текущего кадра).
-  Работает в сетке библиотеки и в ленте редактора. Кнопка Export в
-  редакторе экспортирует выделенные.
-- Двухрежимный редактор: открывается чистый результат кропа; кнопка Crop
-  (или Enter) вызывает инструменты, Done/Enter применяет и скрывает их.
-  Панель кропа теперь сразу под фото, лента миниатюр — в самом низу.
-- Размер файла в метаданных всегда актуален: обновляется при запуске и
-  при изменении файла на диске.
-- **Экспорт на движке MozJPEG** (лучший JPEG-кодировщик по качеству на
-  байт) и высококачественном WebP через sharp — вместо браузерного кодека.
-- **Пресеты экспорта**: правый клик по фото (в сетке или ленте) открывает
-  меню пресетов. Пресет создаётся в диалоге экспорта: имя + формат +
-  лимит МБ + разрешение + папка назначения. Дальше экспорт выделенных
-  фото в нужную папку — в один клик, без диалогов.
-
-## Что нового в 1.5
-
-- Done и Enter применяют правки и остаются на фото; выход из редактора
-  тоже сохраняет всё автоматически.
-- Варианты автогоризонта подписаны техниками: Longest line, Strongest line,
-  Smallest tilt, Original.
-- Дерево папок в боковой панели: родительские папки и вложенные с отступами.
-- **Форматы**: JPEG, PNG, WebP, GIF, AVIF, BMP — нативно; TIFF, HEIC/HEIF и
-  RAW (CR2, CR3, NEF, ARW, ORF, RW2, RAF, DNG, PEF и др.) — через встроенную
-  конвертацию с кэшем на диске. Первое открытие RAW занимает пару секунд,
-  дальше мгновенно. Для RAW используется встроенное в файл JPEG-превью
-  камеры, при его отсутствии — полная проявка. Экзотические/новейшие RAW
-  могут не открыться — такие файлы просто пропускаются.
-
-**ВАЖНО при обновлении на 1.5: перед `npm run dist` один раз выполните
-`npm install` — добавились новые зависимости (sharp, dcraw, heic-convert).**
-
-## Что нового в 1.2
-
-- Автогоризонт: гибридный алгоритм (сильнейшая линия Хафа + консенсус
-  ориентаций + приоритет малых углов) — сам выбирает подходящий метод под фото.
-- Кроп: выбор пропорций разворачивает рамку на максимум по всему кадру
-  (больше никакого прогрессирующего приближения), зум колёсиком мыши в обе
-  стороны — можно отдалить снимок до его реальных границ.
-- Редактор: панель метаданных справа (размер файла, разрешение, дата,
-  параметры кропа), лента миниатюр папки снизу с весом файлов и рейтингом,
-  переключение фото прямо из ленты (правки применяются автоматически).
-- Рейтинг: звёзды 1–5 (клавиши 1–5 в редакторе, 0 — сброс), видны в
-  библиотеке и на ленте.
-- Папки, импортированные в старых версиях, начинают синхронизироваться
-  автоматически; синхронизацию любой папки можно включить/выключить кнопкой
-  при наведении в боковой панели.
-
-## 3.5. Как обновлять уже установленное приложение
-
-Когда в код внесены изменения: положите новые файлы в папку проекта
-(заменив старые), затем `npm run dist` и запустите новый
-`Meridian Setup ....exe` — он установится поверх старой версии как
-обновление. Библиотека и правки сохраняются.
-
-## 4. Как это устроено
-
-- **Папки и доступ**: «Import folder» открывает системный диалог выбора папки —
-  на macOS система сама запросит доступ к Рабочему столу/Документам/Загрузкам,
-  если папка лежит там. Все вложенные подпапки сканируются, папки появляются
-  в боковой панели.
-- **Автосинхронизация**: импортированная папка отслеживается (жёлтая точка
-  в боковой панели): добавили в неё фото на диске — они появятся в библиотеке
-  сами, удалили с диска — исчезнут из библиотеки. Проверка также происходит
-  при возврате фокуса в окно приложения. Если удалить фото такой папки из
-  библиотеки, слежение за папкой отключается (иначе фото вернулись бы при
-  следующем скане).
-- **Хранение**: библиотека (пути к файлам + правки + миниатюры) сохраняется в
-  `library.json` в служебной папке приложения и переживает перезапуски.
-  Сами фотографии остаются на своих местах на диске и **никогда не изменяются** —
-  все правки недеструктивные.
-- **Удаление** из библиотеки не удаляет файлы с диска.
-- Если файл переместили или удалили с диска, при следующем запуске он тихо
-  исчезнет из библиотеки (с уведомлением).
-
-## 5. Структура проекта
-
+```bash
+git clone https://github.com/helgiforest/helgicropper.git
+cd helgicropper
+npm install
+npm start          # build & run
+npm run dist       # create the installer for your OS in release/
 ```
-meridian/
-├── electron/
-│   ├── main.cjs      # главный процесс: окно, доступ к диску, сохранение
-│   └── preload.cjs   # безопасный мост между интерфейсом и системой
-├── src/
-│   ├── App.jsx       # весь интерфейс и логика редактора
-│   └── main.jsx
-├── index.html
-├── vite.config.js
-└── package.json      # зависимости + конфигурация сборки установщиков
-```
+
+Tech: Electron + React + Vite; sharp/libvips with MozJPEG for encoding; dcraw (in a worker thread) for RAW development; Hough-transform horizon detection.

@@ -32,7 +32,7 @@ jobs:
         run: npm install
 
       - name: Build installers
-        run: npm run dist
+        run: npm run dist -- --publish never
 
       # always keep the files downloadable from the workflow run page,
       # even when the build was started manually (Run workflow button)

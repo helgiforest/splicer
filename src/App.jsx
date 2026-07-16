@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from "react";
 
 /* ============================================================
-   MERIDIAN — a focused photo tool (desktop build)
+   SPLICER — a focused photo tool (desktop build)
    Library (Photomator-style) + best-in-class crop,
    auto horizon leveling, and target-file-size export.
 
@@ -2815,7 +2815,7 @@ export default function App() {
       <style>{CSS}</style>
 
       <div className="topbar">
-        <div className="brand"><span className="dot" /><span className="name">MERIDIAN</span></div>
+        <div className="brand"><span className="dot" /><span className="name">SPLICER</span></div>
         <button className="btn" onClick={importPhotos}>{I.upload} Import photos</button>
         <button className="btn" onClick={importFolder}>{I.folder} Import folder</button>
         {!NATIVE && (

@@ -318,6 +318,7 @@ input, select { font-family: inherit; }
 }
 .imgspace .tileimg {
   position: absolute; user-select: none; pointer-events: none; max-width: none;
+  transition: opacity .18s ease;
 }
 /* promoted to its own GPU layer only WHILE zooming/panning: buttery motion
    during the gesture, full-quality re-raster the moment it ends */
@@ -345,14 +346,15 @@ input, select { font-family: inherit; }
 
 .handle { position: absolute; touch-action: none; }
 .handle.corner { width: 22px; height: 22px; }
-.handle.corner::after {
-  content: ""; position: absolute; width: 18px; height: 18px;
-  border: 3px solid #fff; border-radius: 1px;
+.handle.corner::before, .handle.corner::after {
+  content: ""; position: absolute; background: #fff; border-radius: 2px;
 }
-.h-nw { left: -5px; top: -5px; cursor: nwse-resize; } .h-nw::after { border-right: none; border-bottom: none; left: 2px; top: 2px; }
-.h-ne { right: -5px; top: -5px; cursor: nesw-resize; } .h-ne::after { border-left: none; border-bottom: none; right: 2px; top: 2px; }
-.h-sw { left: -5px; bottom: -5px; cursor: nesw-resize; } .h-sw::after { border-right: none; border-top: none; left: 2px; bottom: 2px; }
-.h-se { right: -5px; bottom: -5px; cursor: nwse-resize; } .h-se::after { border-left: none; border-top: none; right: 2px; bottom: 2px; }
+.handle.corner::before { width: 16px; height: 3px; }
+.handle.corner::after { width: 3px; height: 16px; }
+.h-nw { left: -5px; top: -5px; cursor: nwse-resize; } .h-nw::before { left: 5px; top: 5px; } .h-nw::after { left: 5px; top: 5px; }
+.h-ne { right: -5px; top: -5px; cursor: nesw-resize; } .h-ne::before { right: 5px; top: 5px; } .h-ne::after { right: 5px; top: 5px; }
+.h-sw { left: -5px; bottom: -5px; cursor: nesw-resize; } .h-sw::before { left: 5px; bottom: 5px; } .h-sw::after { left: 5px; bottom: 5px; }
+.h-se { right: -5px; bottom: -5px; cursor: nwse-resize; } .h-se::before { right: 5px; bottom: 5px; } .h-se::after { right: 5px; bottom: 5px; }
 .handle.edge { background: transparent; }
 .h-n { left: 24px; right: 24px; top: -6px; height: 12px; cursor: ns-resize; }
 .h-s { left: 24px; right: 24px; bottom: -6px; height: 12px; cursor: ns-resize; }
@@ -376,6 +378,7 @@ input, select { font-family: inherit; }
 .chip:hover { color: var(--text); border-color: var(--faint); }
 .chip.on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
 .chip.icon { padding: 5px 9px; display: inline-flex; }
+.chip:disabled { opacity: .35; cursor: default; pointer-events: none; }
 
 .rot-row { display: flex; align-items: center; gap: 14px; max-width: 620px; margin: 0 auto; width: 100%; }
 .level-opts {
@@ -418,12 +421,12 @@ input[type="range"].rot::-moz-range-thumb {
 .dialog {
   width: 380px; max-width: calc(100vw - 32px);
   background: var(--surface); border: 1px solid var(--stroke);
-  border-radius: 14px; padding: 20px; box-shadow: 0 24px 60px rgba(0,0,0,.5);
+  border-radius: 14px; padding: 22px; box-shadow: 0 24px 60px rgba(0,0,0,.5);
 }
-.dialog h3 { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
-.dialog .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
-.field { margin-bottom: 14px; }
-.field label { display: block; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); margin-bottom: 6px; }
+.dialog h3 { font-size: 16px; font-weight: 600; margin-bottom: 3px; letter-spacing: -.01em; }
+.dialog .sub { color: var(--faint); font-size: 12px; margin-bottom: 18px; font-family: var(--mono); }
+.field { margin-bottom: 13px; }
+.field label { display: block; font-size: 10.5px; letter-spacing: .07em; text-transform: uppercase; color: var(--faint); margin-bottom: 7px; }
 .field .controls { display: flex; gap: 8px; }
 .seg { display: flex; background: var(--raised); border: 1px solid var(--stroke); border-radius: 8px; overflow: hidden; flex: 1; }
 .seg button {
@@ -438,30 +441,33 @@ input[type="range"].rot::-moz-range-thumb {
 }
 .numinput input {
   background: transparent; border: none; outline: none; color: var(--text);
-  width: 100%; font-size: 14px; font-family: var(--mono);
+  width: 100%; font-size: 13.5px; font-family: var(--mono);
 }
-.numinput .unit { color: var(--faint); font-size: 12px; }
+.numinput .unit { color: var(--faint); font-size: 11.5px; flex-shrink: 0; }
 .estimate {
   background: var(--raised); border: 1px solid var(--stroke-soft); border-radius: 10px;
-  padding: 12px 14px; margin: 16px 0; font-size: 13px; color: var(--muted);
-  min-height: 44px; display: flex; align-items: center; gap: 10px;
+  padding: 11px 14px; margin: 14px 0; font-size: 12.5px; color: var(--muted);
+  min-height: 40px; display: flex; align-items: center; gap: 10px; line-height: 1.4;
 }
 .estimate strong { color: var(--text); font-family: var(--mono); font-weight: 600; }
 .estimate.warn { color: var(--danger); border-color: rgba(242,109,109,.35); }
-.dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+.dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 .chk {
   display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
-  font-size: 12.5px; color: var(--muted); cursor: pointer; padding: 0 4px;
+  font-size: 12px; color: var(--muted); cursor: pointer; padding: 0 4px;
 }
-.chk input { accent-color: var(--accent); width: 14px; height: 14px; cursor: pointer; }
-.preset-list { display: flex; flex-direction: column; gap: 5px; }
+.chk-row { display: flex; margin-top: 10px; }
+.chk input { accent-color: var(--accent); width: 14px; height: 14px; cursor: pointer; margin: 0 8px 0 0; }
+.preset-list { display: flex; flex-direction: column; gap: 6px; }
 .preset-row {
-  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
   background: var(--raised); border: 1px solid var(--stroke); border-radius: 8px;
-  padding: 8px 12px; text-align: left; transition: border-color .12s, background .12s;
+  padding: 9px 12px; text-align: left; transition: border-color .12s, background .12s;
 }
 .preset-row:hover { border-color: var(--accent); background: var(--hover); }
 .preset-row:disabled { opacity: .5; }
+.preset-row .cm-name { font-size: 13px; color: var(--text); font-weight: 500; }
+.preset-row .cm-sub { font-size: 11px; color: var(--faint); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
 
 .toast {
   position: fixed; bottom: 26px; left: 50%; transform: translateX(-50%);
@@ -899,6 +905,8 @@ const I = {
   back: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9"><path d="M15 5l-7 7 7 7"/></svg>,
   level: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><circle cx="12" cy="12" r="9"/><path d="M3.5 14.5l17-5"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/></svg>,
   flip: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><rect x="4" y="8" width="16" height="10" rx="1.5"/><path d="M8 4h10a2 2 0 0 1 2 2" opacity=".5"/></svg>,
+  rotateLeft: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M9 4 6 7l3 3"/><path d="M6 7h8a5 5 0 1 1 0 10H8"/></svg>,
+  rotateRight: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M15 4l3 3-3 3"/><path d="M18 7h-8a5 5 0 1 0 0 10h6"/></svg>,
   check: <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#241A03" strokeWidth="3.2"><path d="M5 13l4 4 10-10"/></svg>,
   sort: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M7 4v14m0 0l-3-3m3 3l3-3M17 20V6m0 0l-3 3m3-3l3 3"/></svg>,
   sun: <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4l1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>,
@@ -1042,8 +1050,11 @@ const ASPECTS = [
   { key: "4:3", label: "4:3", v: 4 / 3 },
   { key: "16:9", label: "16:9", v: 16 / 9 },
   { key: "4:5", label: "4:5", v: 4 / 5 },
-  { key: "9:16", label: "9:16", v: 9 / 16 },
 ];
+const swapLabel = (label) => {
+  const m = label.match(/^(\d+):(\d+)$/);
+  return m ? `${m[2]}:${m[1]}` : label;
+};
 const PAD = 36;
 const MIN_CROP = 64;
 
@@ -1068,12 +1079,55 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   const hist = useRef({ undo: [], redo: [] });
   const worldRef = useRef(null);
   const flipSeq = useRef(0);
+  const flipBusyUntil = useRef(0);
   const [flipReq, setFlipReq] = useState(null);
   const gestTimer = useRef(null);
   const gestureOn = useCallback(() => {
     setGesturing(true);
     clearTimeout(gestTimer.current);
     gestTimer.current = setTimeout(() => setGesturing(false), 240);
+  }, []);
+
+  /* Retiring the deep-zoom tile used to be an instant setTile(null): the
+     sharp tile vanished the instant a zoom-out fired, popping the view back
+     to the (now hugely upscaled) blurry proxy for the first frame of the
+     flip animation -- most visible on a double-click zoom-out from a tight
+     zoom, where the proxy/tile quality gap is largest. Cross-fading it out
+     instead hides that pop behind a quick opacity transition, and the
+     motion of the flip itself masks the rest. */
+  const fadeOutTile = useCallback(() => {
+    clearTimeout(tileTimer.current);
+    tileToken.current++;
+    setTile((t) => (t && !t.fading ? { ...t, fading: true } : t));
+    const url = tileUrl.current;
+    tileUrl.current = null;
+    if (url) {
+      setTimeout(() => {
+        setTile((cur) => (cur && cur.fading ? null : cur));
+        URL.revokeObjectURL(url);
+      }, 180);
+    }
+  }, []);
+
+  /* refit()'s "FLIP" trick puts a raw, un-React-managed transform on
+     .world that animates via a CSS transition running outside any render.
+     Any OTHER path that jumps rect/view straight to a new value (wheel
+     zoom, drag, rotate, aspect change, undo) races that transition: the
+     imgspace inside recomputes its own transform for the new state
+     immediately, while .world is still mid-flight from the OLD one, so the
+     two compose into a bogus combined transform for a frame or more —
+     visible as a jitter, or the image swinging off-screen entirely. Every
+     entry point that can change rect/view outside of refit's own animation
+     must cancel any in-flight flip first. */
+  const cancelFlip = useCallback(() => {
+    flipSeq.current++;
+    flipBusyUntil.current = 0;
+    const el = worldRef.current;
+    if (el) {
+      el.style.transition = "none";
+      el.style.transform = "none";
+      el.style.willChange = "auto";
+    }
   }, []);
 
   /* --- crop history (Ctrl+Z / Ctrl+Shift+Z) --- */
@@ -1085,12 +1139,13 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   }, [rect, view, aspect, flipped]);
 
   const restoreSnap = useCallback((s) => {
+    cancelFlip();
     zoomBase.current = s.view.k;
     setRect(s.rect);
     setView(s.view);
     setAspect(s.aspect);
     setFlipped(s.flipped);
-  }, []);
+  }, [cancelFlip]);
 
   const undo = useCallback(() => {
     const s = hist.current.undo.pop();
@@ -1183,6 +1238,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   }, [iw, ih]);
 
   const applyRotation = useCallback((deg) => {
+    cancelFlip();
     setView((v) => {
       if (!v || !rect) return v;
       const c = { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 };
@@ -1194,13 +1250,15 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       [icx, icy] = clampCenter(icx, icy, rect, k, deg);
       return { icx, icy, k, theta: deg };
     });
-  }, [rect, minK, clampCenter]);
+  }, [rect, minK, clampCenter, cancelFlip]);
 
   /* Re-fit uses the FLIP technique: state jumps straight to the final
      layout, and ONE GPU transform on the .world wrapper animates from the
      old geometry to identity. Zero layout work per frame, and the huge
      dim shadow is rasterized once and just composited — no more judder. */
   const refit = useCallback((r, v, animate = true) => {
+    if (animate && performance.now() < flipBusyUntil.current) return;
+    cancelFlip();
     const availW = stage.w - 2 * PAD, availH = stage.h - 2 * PAD;
     if (availW <= 0 || availH <= 0) return;
     const f = Math.min(availW / r.w, availH / r.h);
@@ -1215,12 +1273,22 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       theta: v.theta,
     };
     zoomBase.current = nv.k;
+    if (animate && f < 1) {
+      // zooming out: retire the deep-zoom tile now, in the same render as
+      // the rect/view jump, so it never draws a frame with stale
+      // coordinates against the new geometry — fade it rather than pop it
+      // so the resolution drop isn't a jolt in itself.
+      fadeOutTile();
+    }
     setRect(nr);
     setView(nv);
     if (animate && Math.abs(f - 1) > 1e-4) {
-      setFlipReq({ tx: oc.x - nc.x / f, ty: oc.y - nc.y / f, s: 1 / f, n: ++flipSeq.current });
+      const jump = Math.max(f, 1 / f); // magnitude of the scale change, >=1
+      const dur = clamp(260 + Math.log2(jump) * 55, 260, 460);
+      flipBusyUntil.current = performance.now() + dur + 60;
+      setFlipReq({ tx: oc.x - nc.x / f, ty: oc.y - nc.y / f, s: 1 / f, n: ++flipSeq.current, dur });
     }
-  }, [stage]);
+  }, [stage, fadeOutTile, cancelFlip]);
 
   useLayoutEffect(() => {
     if (!flipReq) return;
@@ -1230,15 +1298,16 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     el.style.transition = "none";
     el.style.willChange = "transform";
     el.style.transform = `translate(${flipReq.tx}px, ${flipReq.ty}px) scale(${flipReq.s})`;
+    const dur = flipReq.dur || 340;
     requestAnimationFrame(() => requestAnimationFrame(() => {
       if (flipSeq.current !== n || !worldRef.current) return;
-      el.style.transition = "transform .34s cubic-bezier(.3,.9,.3,1)";
+      el.style.transition = `transform ${dur}ms cubic-bezier(.22,.85,.32,1)`;
       el.style.transform = "none";
       setTimeout(() => {
         if (flipSeq.current !== n || !worldRef.current) return;
         el.style.transition = "none";
         el.style.willChange = "auto";
-      }, 400);
+      }, dur + 60);
     }));
   }, [flipReq]);
 
@@ -1256,6 +1325,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     if (e.button !== undefined && e.button !== 0) return; // left button only
     e.preventDefault(); e.stopPropagation();
     if (!rect || !view) return;
+    cancelFlip();
     drag.current = {
       mode,
       sx: e.clientX, sy: e.clientY,
@@ -1392,15 +1462,41 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     return rectOf(lo);
   }, [iw, ih, coverageOK]);
 
+  /* --- rotate the crop frame itself by a quarter turn (portrait <-> landscape),
+         e.g. for photos shot with the camera on its side. Separate from the
+         fine leveling slider below: it swaps the frame's own w/h and carries
+         the current fine angle straight through, so a 90 deg turn plus a
+         small horizon tweak compose cleanly (baked angle = rot90 + fine,
+         wrapped to -180..180). --- */
+  const rotate90 = useCallback((dir = 1) => {
+    if (!rect || !view) return;
+    snapshot();
+    cancelFlip();
+    const cx = rect.x + rect.w / 2, cy = rect.y + rect.h / 2;
+    const nr = { x: cx - rect.h / 2, y: cy - rect.w / 2, w: rect.h, h: rect.w };
+    let deg = view.theta + dir * 90;
+    if (deg > 180) deg -= 360;
+    if (deg < -180) deg += 360;
+    const k = Math.max(zoomBase.current, minK(nr, deg) * 1.0005);
+    let icx = cx, icy = cy;
+    [icx, icy] = clampCenter(icx, icy, nr, k, deg);
+    setRect(nr);
+    setView({ icx, icy, k, theta: deg });
+    setTimeout(() => setView((vv) => { refit(nr, vv, true); return vv; }), 20);
+  }, [rect, view, snapshot, minK, clampCenter, refit, cancelFlip]);
+
   /* --- aspect selection: expand to the largest crop the whole image
          allows (no more progressive zoom-in), then animate the re-fit --- */
   const pickAspect = (key) => {
     snapshot();
+    cancelFlip();
     setAspect(key);
+    const noFlip = key === "free" || key === "orig" || key === "1:1";
+    if (noFlip && flipped) setFlipped(false);
     if (!rect || !view) return;
     const def = ASPECTS.find((x) => x.key === key);
     let v = def?.key === "orig" ? iw / ih : def?.v || null;
-    if (v && flipped && key !== "1:1") v = 1 / v;
+    if (v && flipped && !noFlip) v = 1 / v;
     if (!v) return;
     const nr = maximizedRect(v, view);
     setRect(nr);
@@ -1408,8 +1504,9 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   };
 
   const toggleFlip = () => {
-    if (!rect || !view || aspect === "1:1") return;
+    if (!rect || !view || aspect === "1:1" || aspect === "free" || aspect === "orig") return;
     snapshot();
+    cancelFlip();
     const nf = !flipped;
     setFlipped(nf);
     const def = ASPECTS.find((x) => x.key === aspect);
@@ -1437,14 +1534,18 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       e.preventDefault();
       const b = el.getBoundingClientRect();
       const m = { x: e.clientX - b.left, y: e.clientY - b.top };
-      const factor = Math.exp(-e.deltaY * 0.0014);
+      const factor = Math.exp(-e.deltaY * 0.0024);
       const availW = stage.w - 2 * PAD, availH = stage.h - 2 * PAD;
       const kFitImg = Math.min(availW / iw, availH / ih); // whole image visible
       const kLow = Math.min(view.k, kFitImg);
-      const kHigh = Math.max(view.k, kFitImg * 20);
+      // capped well short of the old 20x: past this, a fit-to-screen
+      // double-click has to animate such a large jump that the FLIP
+      // transform's compositing glitches become visible.
+      const kHigh = Math.max(view.k, kFitImg * 6);
       const k2 = clamp(view.k * factor, kLow, kHigh);
       const f = k2 / view.k;
       if (Math.abs(f - 1) < 1e-6) return;
+      cancelFlip();
       gestureOn();
       const nr = {
         x: m.x + (rect.x - m.x) * f,
@@ -1463,7 +1564,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
-  }, [rect, view, stage, iw, ih, gestureOn]);
+  }, [rect, view, stage, iw, ih, gestureOn, cancelFlip]);
 
   /* --- deep-zoom sharpness: when the gesture settles and the view is
      zoomed past the proxy's resolution, fetch a tile of the visible
@@ -1472,10 +1573,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     if (!NATIVE || !photo.path || !view || !rect || !stage.w) return;
     const kProxy = PROXY_LONG / Math.max(iw, ih);
     if (view.k <= kProxy * 1.08 || gesturing) {
-      if (view.k <= kProxy * 1.08 && tile) {
-        if (tileUrl.current) { URL.revokeObjectURL(tileUrl.current); tileUrl.current = null; }
-        setTile(null);
-      }
+      if (view.k <= kProxy * 1.08 && tile && !tile.fading) fadeOutTile();
       return;
     }
     clearTimeout(tileTimer.current);
@@ -1544,6 +1642,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
 
   const reset = () => {
     snapshot();
+    cancelFlip();
     setAspect("free"); setFlipped(false); setLevelOpts(null);
     const availW = stage.w - 2 * PAD, availH = stage.h - 2 * PAD;
     const k = Math.min(availW / iw, availH / ih);
@@ -1642,10 +1741,16 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
         if (next) switchTo(next.id);
         return;
       }
-      if (ev.key === "Escape") exit();
+      if (ev.key === "Escape") { ev.preventDefault(); exit(); }
       else if (ev.key === "Enter") {
+        ev.preventDefault();
         if (mode === "crop") apply();
         else setMode("crop");
+      }
+      else if (ev.key === "[" || ev.key === "]") {
+        if (mode !== "crop") return;
+        ev.preventDefault();
+        rotate90(ev.key === "]" ? 1 : -1);
       }
       else if (/^[0-5]$/.test(ev.key)) {
         const n = parseInt(ev.key, 10);
@@ -1653,12 +1758,14 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
         toast(n ? `Rated ${"★".repeat(n)}` : "Rating cleared");
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onRate, photo.id, suppressKeys, toast, rect, view, mode, siblings, undo, redo]);
 
   const theta = view ? view.theta : 0;
+  const rot90Steps = Math.round(theta / 90);
+  const fineTheta = Math.round((theta - rot90Steps * 90) * 10) / 10;
   const outW = rect && view ? Math.round(Math.min(iw, rect.w / view.k)) : 0;
   const outH = rect && view ? Math.round(Math.min(ih, rect.h / view.k)) : 0;
 
@@ -1706,7 +1813,6 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
           e.preventDefault();
           onContextExport(photo.id, e.clientX, e.clientY);
         }}
-        title="Drag empty space to pan · double-click to recenter · right-click to export"
       >
         <div className="world" ref={worldRef}>
         {view && mode === "crop" && (
@@ -1724,7 +1830,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
                 src={tile.url}
                 alt=""
                 draggable={false}
-                style={{ left: tile.sx, top: tile.sy, width: tile.sw, height: tile.sh }}
+                style={{ left: tile.sx, top: tile.sy, width: tile.sw, height: tile.sh, opacity: tile.fading ? 0 : 1 }}
               />
             )}
           </div>
@@ -1748,7 +1854,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
                   src={tile.url}
                   alt=""
                   draggable={false}
-                  style={{ left: tile.sx, top: tile.sy, width: tile.sw, height: tile.sh }}
+                  style={{ left: tile.sx, top: tile.sy, width: tile.sw, height: tile.sh, opacity: tile.fading ? 0 : 1 }}
                 />
               )}
             </div>
@@ -1806,16 +1912,23 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
         <div className="aspects">
           {ASPECTS.map((a) => (
             <button key={a.key} className={`chip ${aspect === a.key ? "on" : ""}`} onClick={() => pickAspect(a.key)}>
-              {a.label}
+              {flipped && a.v && a.v !== 1 ? swapLabel(a.label) : a.label}
             </button>
           ))}
           <button
             className="chip icon"
             title="Swap portrait / landscape"
             onClick={toggleFlip}
+            disabled={aspect === "1:1" || aspect === "free" || aspect === "orig"}
             style={flipped ? { color: "var(--accent)", borderColor: "var(--accent)" } : undefined}
           >
             {I.flip}
+          </button>
+          <button className="chip icon" title="Rotate 90° left" onClick={() => rotate90(-1)}>
+            {I.rotateLeft}
+          </button>
+          <button className="chip icon" title="Rotate 90° right" onClick={() => rotate90(1)}>
+            {I.rotateRight}
           </button>
         </div>
         <div className="rot-row">
@@ -1826,14 +1939,14 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
             <div className="notch" />
             <input
               type="range" className="rot" min={-45} max={45} step={0.1}
-              value={theta}
+              value={fineTheta}
               onPointerDown={snapshot}
-              onChange={(e) => applyRotation(parseFloat(e.target.value))}
-              onDoubleClick={() => { snapshot(); applyRotation(0); }}
+              onChange={(e) => applyRotation(rot90Steps * 90 + parseFloat(e.target.value))}
+              onDoubleClick={() => { snapshot(); applyRotation(rot90Steps * 90); }}
             />
           </div>
-          <div className={`degree ${Math.abs(theta) < 0.05 ? "zero" : ""}`}>
-            {theta > 0 ? "+" : ""}{theta.toFixed(1)}°
+          <div className={`degree ${Math.abs(fineTheta) < 0.05 ? "zero" : ""}`}>
+            {fineTheta > 0 ? "+" : ""}{fineTheta.toFixed(1)}°
           </div>
         </div>
       </div>
@@ -1866,6 +1979,11 @@ function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, toas
   const [presetName, setPresetName] = useState("");
   const [template, setTemplate] = useState("{name}");
   const [keepExif, setKeepExif] = useState(false);
+  const veilDownOnSelf = useRef(false);
+  const closeOnVeil = useCallback((e) => {
+    if (e.target === e.currentTarget && veilDownOnSelf.current && !exporting) onClose();
+    veilDownOnSelf.current = false;
+  }, [exporting, onClose]);
   const canvasCache = useRef({}); // scale -> canvas (browser fallback)
   const solverCache = useRef({}); // `${scale}|${mime}` -> solve() (browser fallback)
   const single = items.length === 1;
@@ -1891,6 +2009,7 @@ function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, toas
     if (!single) return;
     let alive = true;
     setCalculating(true);
+    const delay = estimate ? 400 : 0; // no delay on first open — nothing to show yet
     const t = setTimeout(async () => {
       try {
         if (NATIVE && items[0].photo.path) {
@@ -1915,8 +2034,9 @@ function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, toas
       } catch {
         if (alive) { setEstimate(null); setCalculating(false); }
       }
-    }, 300);
+    }, delay);
     return () => { alive = false; clearTimeout(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [single, items, mime, format, targetBytes, targetMBn, scale, keepExif, getSolver]);
 
   const browserDownload = (blob, name) => {
@@ -1978,7 +2098,11 @@ function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, toas
   };
 
   return (
-    <div className="veil" onClick={(e) => { if (e.target === e.currentTarget && !exporting) onClose(); }}>
+    <div
+      className="veil"
+      onPointerDown={(e) => { veilDownOnSelf.current = e.target === e.currentTarget; }}
+      onPointerUp={closeOnVeil}
+    >
       <div className="dialog">
         <h3>Export</h3>
         <div className="sub">{single ? items[0].photo.name : `${items.length} photos selected`}</div>
@@ -2033,21 +2157,10 @@ function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, toas
 
         {NATIVE && (
           <div className="field">
-            <label>File name · {"{name}"} and {"{date}"} are replaced</label>
-            <div className="controls">
-              <div className="numinput" style={{ flex: 1 }}>
-                <input
-                  type="text"
-                  value={template}
-                  onChange={(e) => setTemplate(e.target.value)}
-                  style={{ fontFamily: "var(--mono)", fontSize: 12.5 }}
-                />
-              </div>
-              <label className="chk" title="Copy camera, lens and capture date into the exported file. Off = clean file for publishing.">
-                <input type="checkbox" checked={keepExif} onChange={(e) => setKeepExif(e.target.checked)} />
-                Keep EXIF
-              </label>
-            </div>
+            <label className="chk" title="Adds camera, lens and date to the file">
+              <input type="checkbox" checked={keepExif} onChange={(e) => setKeepExif(e.target.checked)} />
+              Keep EXIF
+            </label>
           </div>
         )}
 
@@ -2079,12 +2192,12 @@ function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, toas
 
         {onSavePreset && (
           <div className="field">
-            <label>Save as preset (remembers folder, format & size)</label>
+            <label title="Remembers folder, format and size">Save as preset</label>
             <div className="controls">
               <div className="numinput" style={{ flex: 1 }}>
                 <input
                   type="text"
-                  placeholder="Preset name, e.g. Telegram 2MB"
+                  placeholder="Preset name"
                   value={presetName}
                   onChange={(e) => setPresetName(e.target.value)}
                   style={{ fontFamily: "var(--sans)" }}
@@ -2093,6 +2206,7 @@ function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, toas
               <button
                 className="btn"
                 disabled={!presetName.trim() || exporting}
+                title="Pick a folder and save"
                 onClick={async () => {
                   const ok = await onSavePreset({
                     name: presetName.trim(), format, targetMB: targetMBn, scale, template, keepExif,
@@ -2100,7 +2214,7 @@ function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, toas
                   if (ok) setPresetName("");
                 }}
               >
-                Choose folder & save
+                Save…
               </button>
             </div>
           </div>

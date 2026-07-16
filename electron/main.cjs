@@ -4,6 +4,26 @@ const fs = require("fs");
 const fsp = fs.promises;
 const { pathToFileURL } = require("url");
 
+/* one-time migration: userData lives at Application Support/<productName>,
+   so renaming the app from Meridian to Splicer would otherwise point every
+   user at a fresh, empty folder — losing their library.json (watched
+   folders, ratings, crops, presets) and forcing every RAW/HEIC file to
+   reconvert. If Splicer's folder has no library yet but a Meridian one
+   exists alongside it, adopt its contents instead of leaving them orphaned. */
+(function migrateUserData() {
+  const newDir = app.getPath("userData");
+  if (fs.existsSync(path.join(newDir, "library.json"))) return;
+  const oldDir = path.join(path.dirname(newDir), "Meridian");
+  if (!fs.existsSync(path.join(oldDir, "library.json"))) return;
+  try {
+    fs.mkdirSync(newDir, { recursive: true });
+    for (const name of fs.readdirSync(oldDir)) {
+      const dest = path.join(newDir, name);
+      if (!fs.existsSync(dest)) fs.renameSync(path.join(oldDir, name), dest);
+    }
+  } catch {}
+})();
+
 const NATIVE_RE = /\.(jpe?g|png|webp|gif|avif|bmp)$/i;   // Chromium decodes these itself
 const TIFF_RE = /\.(tif|tiff)$/i;
 const HEIC_RE = /\.(heic|heif)$/i;
@@ -307,7 +327,7 @@ function createWindow() {
     minWidth: 940,
     minHeight: 620,
     backgroundColor: "#0B0C0F",
-    title: "Meridian",
+    title: "Splicer",
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -582,23 +602,31 @@ function bakeCached(item, scalePct) {
 
 /* deep-zoom tile: exact visible region of the ORIENTED original at the
    requested pixel density — snaps the proxy view to pixel sharpness */
+let tileGen = 0;
 ipcMain.handle("render-tile", async (_e, p, t) => {
+  const myGen = ++tileGen;
   try {
-    const sharp = require("sharp");
-    const src = needsConvert(p) ? await convertOnce(p) : p;
-    const sx = Math.max(0, Math.round(t.sx));
-    const sy = Math.max(0, Math.round(t.sy));
-    const sw = Math.max(4, Math.round(t.sw));
-    const sh = Math.max(4, Math.round(t.sh));
-    const dw = Math.min(4096, Math.max(8, Math.round(t.dw)));
-    const buf = await sharp(src, { limitInputPixels: false })
-      .rotate()
-      .extract({ left: sx, top: sy, width: sw, height: sh })
-      .resize({ width: dw })
-      .jpeg({ quality: 90, chromaSubsampling: "4:4:4" })
-      .withMetadata()
-      .toBuffer();
-    return buf;
+    await acquireSlot();
+    try {
+      if (myGen !== tileGen) return null; // a newer tile request superseded this one while queued
+      const sharp = require("sharp");
+      const src = needsConvert(p) ? await convertOnce(p) : p;
+      const sx = Math.max(0, Math.round(t.sx));
+      const sy = Math.max(0, Math.round(t.sy));
+      const sw = Math.max(4, Math.round(t.sw));
+      const sh = Math.max(4, Math.round(t.sh));
+      const dw = Math.min(4096, Math.max(8, Math.round(t.dw)));
+      const buf = await sharp(src, { limitInputPixels: false })
+        .rotate()
+        .extract({ left: sx, top: sy, width: sw, height: sh })
+        .resize({ width: dw })
+        .jpeg({ quality: 90, chromaSubsampling: "4:4:4" })
+        .withMetadata()
+        .toBuffer();
+      return myGen === tileGen ? buf : null;
+    } finally {
+      releaseSlot();
+    }
   } catch {
     return null;
   }
@@ -680,10 +708,32 @@ function uniquePath(dir, fileName) {
 
 ipcMain.handle("estimate-photo", async (_e, item, opts) => {
   try {
-    const raw = await bakeCached(item, opts.scale);
+    const targetBytes = opts.targetMB * 1024 * 1024;
+    const fullRaw = await bakeCached(item, opts.scale);
     const meta = opts.keepExif ? await exifMetaFor(item.path) : null;
-    const res = await encodeToTarget(raw, opts.format, opts.targetMB * 1024 * 1024, meta);
-    return { size: res.buf.length, quality: res.quality, over: res.over, maxed: res.maxed, w: raw.info.width, h: raw.info.height };
+    const fullPixels = fullRaw.info.width * fullRaw.info.height;
+
+    // For large images, search quality on a much smaller preview (long edge
+    // capped ~1400px) and scale the resulting byte count back up by the
+    // pixel-count ratio. JPEG/WebP size is close to linear in pixel count at
+    // a fixed quality, so this gives a near-instant, still-accurate estimate.
+    // The real export always encodes at full resolution — this only speeds
+    // up the live preview number in the dialog.
+    const PREVIEW_CAP = 1400 * 1400;
+    let raw = fullRaw, sizeRatio = 1;
+    if (fullPixels > PREVIEW_CAP * 1.3) {
+      const previewScale = Math.sqrt(PREVIEW_CAP / fullPixels) * 100;
+      raw = await bakeRaw(item, opts.scale * (previewScale / 100));
+      sizeRatio = fullPixels / (raw.info.width * raw.info.height);
+    }
+
+    const res = await encodeToTarget(raw, opts.format, targetBytes / sizeRatio, meta);
+    const scaledSize = Math.round(res.buf.length * sizeRatio);
+    return {
+      size: sizeRatio > 1 ? Math.min(scaledSize, res.over ? scaledSize : Math.max(scaledSize, 1)) : res.buf.length,
+      quality: res.quality, over: res.over, maxed: res.maxed,
+      w: fullRaw.info.width, h: fullRaw.info.height,
+    };
   } catch (err) {
     return { error: String(err) };
   }

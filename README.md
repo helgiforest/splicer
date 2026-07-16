@@ -1,10 +1,10 @@
-# Meridian
+# Splicer
 
 **A focused photo tool: library, precision crop, automatic horizon leveling, and size-targeted export.**
 
-Meridian does a few things and does them properly. It doesn't try to replace a full editor — it's built for the workflow of *straighten → crop → export at exactly the file size you need*, with a real photo library underneath.
+Splicer does a few things and does them properly. It doesn't try to replace a full editor — it's built for the workflow of *straighten → crop → export at exactly the file size you need*, with a real photo library underneath.
 
-![Meridian](https://img.shields.io/badge/version-2.0.3-f3c34f) ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-1c1f26)
+![Splicer](https://img.shields.io/badge/version-2.0.3-f3c34f) ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-1c1f26)
 
 ---
 
@@ -13,7 +13,7 @@ Meridian does a few things and does them properly. It doesn't try to replace a f
 - **Photo library** that mirrors your real folders — import a folder once and it stays in sync with the disk automatically. Originals are **never modified**; every edit is non-destructive and reversible.
 - **Precision crop**: aspect presets (1:1, 3:2, 4:3, 16:9, 4:5, 9:16…), rule-of-thirds grid, ±45° rotation with auto-fill, hand tool, canvas zoom, full undo history (Ctrl+Z).
 - **Auto horizon leveling** built on line detection (Hough transform ranked by line length) — one click, with alternative suggestions if the first guess is off, and a batch mode for whole selections.
-- **Size-targeted export**: type "9 MB" and Meridian binary-searches the encoder to land just under it. Powered by **MozJPEG** (best-in-class quality per byte) and high-effort WebP, with a live size estimate before you save.
+- **Size-targeted export**: type "9 MB" and Splicer binary-searches the encoder to land just under it. Powered by **MozJPEG** (best-in-class quality per byte) and high-effort WebP, with a live size estimate before you save.
 - **Export presets**: save "Telegram · ≤2 MB · JPEG → D:\Out" once, then right-click any photos → one click and they're compressed and delivered to that folder. Filename templates (`{name}`, `{date}`) and optional EXIF carry-over included.
 - **Big-file ready**: a proxy pyramid keeps 200-megapixel files panning and zooming as smoothly as phone photos, with on-demand full-resolution tiles when you zoom in.
 - **Wide format support**: JPEG, PNG, WebP, GIF, AVIF, BMP, TIFF, HEIC/HEIF and camera RAW (CR2, CR3, NEF, ARW, ORF, RW2, RAF, DNG, PEF and more).
@@ -29,30 +29,29 @@ Grab the file for your system from the **[latest release](../../releases/latest)
 
 | System | File | Notes |
 |---|---|---|
-| **Windows 10/11** | `Meridian Setup X.X.X.exe` | Regular installer |
-| **macOS — Apple Silicon** (M1–M4) | `Meridian-X.X.X-arm64.dmg` | Check your chip:  → About This Mac |
-| **macOS — Intel** | `Meridian-X.X.X-x64.dmg` | |
-| **Linux** | `Meridian-X.X.X.AppImage` | No installation needed |
+| **Windows 10/11** | `Splicer Setup X.X.X.exe` | Regular installer |
+| **macOS — Apple Silicon** | `Splicer-X.X.X-arm64.dmg` | |
+| **Linux** | `Splicer-X.X.X.AppImage` | No installation needed |
 
 The app is not code-signed with a paid certificate, so each OS shows a one-time warning on first launch. This is expected — here's how to get past it:
 
 ### Windows
 1. Run the `.exe`. If **SmartScreen** appears ("Windows protected your PC"): click **More info → Run anyway**.
-2. Follow the installer. Launch Meridian from the Start menu.
+2. Follow the installer. Launch Splicer from the Start menu.
 
 ### macOS
-1. Open the `.dmg` and drag **Meridian** into **Applications**.
+1. Open the `.dmg` and drag **Splicer** into **Applications**.
 2. First launch: **right-click the app → Open → Open** (a plain double-click will be blocked once).
 3. If macOS says the app *"is damaged and can't be opened"* — it isn't damaged, it's the quarantine flag on unsigned downloads. Open **Terminal** and run:
    ```
-   xattr -cr /Applications/Meridian.app
+   xattr -cr /Applications/Splicer.app
    ```
    then launch normally.
 
 ### Linux
 ```bash
-chmod +x Meridian-*.AppImage
-./Meridian-*.AppImage
+chmod +x Splicer-*.AppImage
+./Splicer-*.AppImage
 ```
 If it complains about FUSE: `sudo apt install libfuse2`.
 

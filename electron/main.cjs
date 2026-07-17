@@ -371,9 +371,12 @@ app.whenReady().then(() => {
     }
   });
 
-  if (process.platform === "darwin") {
+  if (process.platform === "darwin" && !app.isPackaged) {
     // packaged builds get the Dock icon from the .icns bundle automatically;
-    // an unpackaged `npm start` run needs it set explicitly to match
+    // an unpackaged `npm start` run needs it set explicitly to match.
+    // build/ isn't in the electron-builder "files" list, so this path
+    // doesn't exist in packaged builds — gate on isPackaged or this throws
+    // before createWindow() runs and the app silently never shows a window.
     app.dock.setIcon(path.join(__dirname, "..", "build", "icon.png"));
   }
   createWindow();

@@ -1,7 +1,7 @@
 {
   "name": "splicer-photos",
   "productName": "Splicer",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "A focused photo tool: library, crop, auto horizon, target-size export",
   "main": "electron/main.cjs",
   "private": true,
@@ -33,6 +33,7 @@
     "files": [
       "dist/**",
       "electron/**",
+      "build/icon.png",
       "package.json"
     ],
     "directories": {

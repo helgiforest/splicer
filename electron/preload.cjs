@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld("meridian", {
   pickDir: () => ipcRenderer.invoke("pick-dir"),
   renderTile: (p, t) => ipcRenderer.invoke("render-tile", p, t),
   readExif: (p) => ipcRenderer.invoke("read-exif", p),
+  logError: (message) => ipcRenderer.invoke("log-error", message),
   onExportProgress: (cb) => {
     const handler = (_e, payload) => cb(payload);
     ipcRenderer.on("export-progress", handler);

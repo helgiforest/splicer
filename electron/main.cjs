@@ -4,6 +4,23 @@ const fs = require("fs");
 const fsp = fs.promises;
 const { pathToFileURL } = require("url");
 
+/* ---------------- file logging ----------------
+   One plain-text file per day under userData/logs, so a bug report can
+   include a log file instead of a DevTools screenshot. Covers main-process
+   crashes here, plus renderer errors (including CSP violations, which
+   don't throw — they only fire a securitypolicyviolation event) reported
+   through the log-error IPC channel registered further down. */
+function appendLog(line) {
+  try {
+    const dir = path.join(app.getPath("userData"), "logs");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${new Date().toISOString().slice(0, 10)}.log`);
+    fs.appendFileSync(file, `[${new Date().toISOString()}] ${line}\n`);
+  } catch {}
+}
+process.on("uncaughtException", (err) => appendLog(`[main] uncaughtException: ${err?.stack || err}`));
+process.on("unhandledRejection", (reason) => appendLog(`[main] unhandledRejection: ${reason?.stack || reason}`));
+
 /* one-time migration: userData lives at Application Support/<productName>,
    so renaming the app from Meridian to Splicer would otherwise point every
    user at a fresh, empty folder — losing their library.json (watched
@@ -247,7 +264,7 @@ let mainWindow = null;
 protocol.registerSchemesAsPrivileged([
   {
     scheme: "photo",
-    privileges: { secure: true, supportFetchAPI: true, stream: true, bypassCSP: true },
+    privileges: { secure: true, supportFetchAPI: true, stream: true, corsEnabled: true },
   },
 ]);
 
@@ -318,6 +335,24 @@ function unwatchRoot(root) {
   watchers.delete(root);
 }
 
+/* ---------------- path allowlist ----------------
+   The renderer is trusted (contextIsolation + a narrow contextBridge API,
+   no remote content ever loads), but the photo:// protocol and the IPC
+   handlers below take a raw path and read/convert whatever's there. This
+   allowlist keeps that scoped to files the app actually knows about —
+   watched folders, plus individually-imported files that aren't under
+   one — so a compromised renderer (e.g. a supply-chain-poisoned
+   dependency) can't use them as a generic arbitrary-file-read primitive. */
+const allowedFiles = new Set();
+function isAllowedPath(p) {
+  if (allowedFiles.has(p)) return true;
+  for (const root of watchers.keys()) {
+    const rel = path.relative(root, p);
+    if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return true;
+  }
+  return false;
+}
+
 /* ---------------- window ---------------- */
 
 function createWindow() {
@@ -334,10 +369,16 @@ function createWindow() {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
     },
   });
   mainWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
+
+  // the app never links out; block any navigation/new-window attempt
+  // (e.g. from a stray target="_blank") instead of letting it hijack
+  // the window or spawn an unsandboxed popup
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  mainWindow.webContents.on("will-navigate", (e) => e.preventDefault());
 
   // Catch changes that happened while the app was in the background
   mainWindow.on("focus", () => {
@@ -346,10 +387,13 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  appendLog(`[main] app ready, version ${app.getVersion()}, platform ${process.platform}`);
+
   protocol.handle("photo", async (request) => {
     const rest = request.url.replace(/^photo:\/\//, "");
     const [encPath, query] = rest.split("?");
     const p = decodeURIComponent(encPath);
+    if (!isAllowedPath(p)) return new Response("not found", { status: 404 });
     try {
       if (query && query.includes("thumb")) {
         const t = await thumbFor(p);
@@ -414,6 +458,7 @@ ipcMain.handle("pick-files", async () => {
       const st = await fsp.stat(p);
       size = st.size; mtime = st.mtimeMs;
     } catch {}
+    allowedFiles.add(p);
     out.push({ path: p, name: path.basename(p), folder: "", size, mtime });
   }
   return out;
@@ -451,6 +496,7 @@ ipcMain.handle("import-paths", async (_e, paths) => {
         watchRoot(p);
         roots.push(p);
       } else if (st.isFile() && isImg(p)) {
+        allowedFiles.add(p);
         records.push({ path: p, name: path.basename(p), folder: "", size: st.size, mtime: st.mtimeMs });
       }
     } catch {
@@ -483,6 +529,8 @@ ipcMain.handle("load-library", async () => {
         it.sizeBytes = st.size;      // always refresh: the file may have
         it.size = st.size;           // been replaced on disk since import
         it.mtime = st.mtimeMs;
+        delete it.previewUrl;        // blob: URL from a past session — dead on arrival
+        allowedFiles.add(it.path);
         alive.push(it);
       } catch {
         missing++;
@@ -613,6 +661,7 @@ function bakeCached(item, scalePct) {
    requested pixel density — snaps the proxy view to pixel sharpness */
 let tileGen = 0;
 ipcMain.handle("render-tile", async (_e, p, t) => {
+  if (!isAllowedPath(p)) return null;
   const myGen = ++tileGen;
   try {
     await acquireSlot();
@@ -641,7 +690,13 @@ ipcMain.handle("render-tile", async (_e, p, t) => {
   }
 });
 
+ipcMain.handle("log-error", (_e, message) => {
+  appendLog(`[renderer] ${String(message).slice(0, 2000)}`);
+  return true;
+});
+
 ipcMain.handle("read-exif", async (_e, p) => {
+  if (!isAllowedPath(p)) return null;
   try {
     const exifr = require("exifr");
     const d = await exifr.parse(p, {
@@ -716,6 +771,7 @@ function uniquePath(dir, fileName) {
 }
 
 ipcMain.handle("estimate-photo", async (_e, item, opts) => {
+  if (!isAllowedPath(item.path)) return { error: "not found" };
   try {
     const targetBytes = opts.targetMB * 1024 * 1024;
     const fullRaw = await bakeCached(item, opts.scale);
@@ -757,6 +813,8 @@ ipcMain.handle("pick-dir", async () => {
 });
 
 ipcMain.handle("export-photos", async (event, items, opts) => {
+  items = items.filter((it) => isAllowedPath(it.path));
+  if (!items.length) return { canceled: true };
   let dir = opts.dir || null;
   const ext = opts.format === "webp" ? "webp" : "jpg";
   if (!dir) {

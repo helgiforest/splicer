@@ -1,7 +1,7 @@
 {
   "name": "splicer-photos",
   "productName": "Splicer",
-  "version": "2.2.2",
+  "version": "2.3.0",
   "description": "A focused photo tool: library, crop, auto horizon, target-size export",
   "main": "electron/main.cjs",
   "private": true,
@@ -23,8 +23,8 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",
-    "electron": "^31.3.0",
-    "electron-builder": "^24.13.3",
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3",
     "vite": "^5.4.0"
   },
   "build": {

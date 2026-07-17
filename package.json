@@ -1,7 +1,7 @@
 {
   "name": "splicer-photos",
   "productName": "Splicer",
-  "version": "2.0.1",
+  "version": "2.2.0",
   "description": "A focused photo tool: library, crop, auto horizon, target-size export",
   "main": "electron/main.cjs",
   "private": true,
@@ -40,11 +40,13 @@
     },
     "mac": {
       "target": "dmg",
-      "category": "public.app-category.photography"
+      "category": "public.app-category.photography",
+      "icon": "build/icon.icns"
     },
     "win": {
       "target": "nsis",
-      "signAndEditExecutable": false
+      "signAndEditExecutable": false,
+      "icon": "build/icon.ico"
     },
     "nsis": {
       "oneClick": false,
@@ -52,7 +54,8 @@
     },
     "linux": {
       "target": "AppImage",
-      "category": "Graphics"
+      "category": "Graphics",
+      "icon": "build/icon.png"
     },
     "asarUnpack": [
       "**/node_modules/sharp/**",

@@ -30,7 +30,8 @@ Grab the file for your system from the **[latest release](../../releases/latest)
 | System | File | Notes |
 |---|---|---|
 | **Windows 10/11** | `Splicer Setup X.X.X.exe` | Regular installer |
-| **macOS — Apple Silicon** | `Splicer-X.X.X-arm64.dmg` | |
+| **macOS — Apple Silicon** | `Splicer-X.X.X-arm64.dmg` | M1–M4 Macs |
+| **macOS — Intel** | `Splicer-X.X.X-x64.dmg` | |
 | **Linux** | `Splicer-X.X.X.AppImage` | No installation needed |
 
 The app is not code-signed with a paid certificate, so each OS shows a one-time warning on first launch. This is expected — here's how to get past it:

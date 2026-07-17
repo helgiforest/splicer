@@ -15,7 +15,11 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        # macos-latest is Apple Silicon (arm64); macos-latest-large is the
+        # Intel (x64) counterpart of the same macOS release (macos-13 was
+        # retired). Both build natively, no cross-compiling, so
+        # sharp/dcraw's native binaries install correctly on each.
+        os: [macos-latest, macos-latest-large, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
       # skip code signing (no paid certificate) — users get the usual

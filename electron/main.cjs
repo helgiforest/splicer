@@ -328,6 +328,7 @@ function createWindow() {
     minHeight: 620,
     backgroundColor: "#0B0C0F",
     title: "Splicer",
+    icon: path.join(__dirname, "..", "build", "icon.png"),
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -370,6 +371,11 @@ app.whenReady().then(() => {
     }
   });
 
+  if (process.platform === "darwin") {
+    // packaged builds get the Dock icon from the .icns bundle automatically;
+    // an unpackaged `npm start` run needs it set explicitly to match
+    app.dock.setIcon(path.join(__dirname, "..", "build", "icon.png"));
+  }
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

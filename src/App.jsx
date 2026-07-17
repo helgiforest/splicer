@@ -18,26 +18,32 @@ const PROXY_LONG = 3200;
 
 /* bake a small edited preview from the PROXY (fast even for 200-MP files) */
 async function bakePreview(srcUrl, origW, origH, edits, maxDim = 560) {
-  const img = await loadImage(srcUrl);
-  const s0 = img.naturalWidth / origW; // proxy px per original px
-  const e = edits || { theta: 0, qcx: 0, qcy: 0, cw: origW, ch: origH };
-  let outW = e.cw * s0, outH = e.ch * s0;
-  const cap = maxDim / Math.max(outW, outH);
-  if (cap < 1) { outW *= cap; outH *= cap; }
-  outW = Math.max(1, Math.round(outW));
-  outH = Math.max(1, Math.round(outH));
-  const s = outW / e.cw;
-  const canvas = document.createElement("canvas");
-  canvas.width = outW; canvas.height = outH;
-  const ctx = canvas.getContext("2d");
-  ctx.imageSmoothingQuality = "high";
-  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, outW, outH);
-  ctx.translate(outW / 2, outH / 2);
-  ctx.scale(s / s0, s / s0);
-  ctx.rotate(rad(e.theta));
-  ctx.translate(-e.qcx * s0, -e.qcy * s0);
-  ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
-  return canvas.toDataURL("image/jpeg", 0.82);
+  // best-effort: a canvas read failure here (e.g. a still-loading proxy file)
+  // should just skip the live preview, never hand back a broken image
+  try {
+    const img = await loadImage(srcUrl);
+    const s0 = img.naturalWidth / origW; // proxy px per original px
+    const e = edits || { theta: 0, qcx: 0, qcy: 0, cw: origW, ch: origH };
+    let outW = e.cw * s0, outH = e.ch * s0;
+    const cap = maxDim / Math.max(outW, outH);
+    if (cap < 1) { outW *= cap; outH *= cap; }
+    outW = Math.max(1, Math.round(outW));
+    outH = Math.max(1, Math.round(outH));
+    const s = outW / e.cw;
+    const canvas = document.createElement("canvas");
+    canvas.width = outW; canvas.height = outH;
+    const ctx = canvas.getContext("2d");
+    ctx.imageSmoothingQuality = "high";
+    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, outW, outH);
+    ctx.translate(outW / 2, outH / 2);
+    ctx.scale(s / s0, s / s0);
+    ctx.rotate(rad(e.theta));
+    ctx.translate(-e.qcx * s0, -e.qcy * s0);
+    ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+    return canvas.toDataURL("image/jpeg", 0.82);
+  } catch {
+    return null;
+  }
 }
 const isUnder = (p, root) => {
   if (!p || !root) return false;
@@ -101,6 +107,7 @@ input, select { font-family: inherit; }
 
 /* ---------- top bar ---------- */
 .topbar {
+  position: relative;
   height: 52px;
   display: flex;
   align-items: center;
@@ -110,6 +117,14 @@ input, select { font-family: inherit; }
   background: var(--surface);
   flex-shrink: 0;
 }
+.topbar-progress {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 13px; color: var(--text); background: var(--raised);
+  border: 1px solid var(--stroke); border-radius: 8px; padding: 6px 14px;
+  pointer-events: none; animation: progressin .15s ease;
+}
+@keyframes progressin { from { opacity: 0; } to { opacity: 1; } }
 .brand {
   display: flex; align-items: baseline; gap: 8px;
   margin-right: 8px; user-select: none;
@@ -552,6 +567,7 @@ function loadImage(url) {
   if (imgCache.has(url)) return imgCache.get(url);
   const p = new Promise((res, rej) => {
     const im = new Image();
+    im.crossOrigin = "anonymous"; // avoid tainting the canvas when drawing photo:// images
     im.onload = () => res(im);
     im.onerror = rej;
     im.src = url;
@@ -1058,7 +1074,7 @@ const swapLabel = (label) => {
 const PAD = 36;
 const MIN_CROP = 64;
 
-function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExportSelected, onRate, selected, onToggleSel, onRangeSel, onContextExport, suppressKeys, theme, onToggleTheme, toast }) {
+function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExportSelected, onRate, selected, onToggleSel, onRangeSel, onContextExport, suppressKeys, theme, onToggleTheme, toast, busyExport }) {
   const stageRef = useRef(null);
   const [stage, setStage] = useState({ w: 0, h: 0 });
   const [rect, setRect] = useState(null);
@@ -1689,7 +1705,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     setLevelOpts(null);
     if (rect && view) refit(rect, view, true); // normalize the fitted view
     setMode("view");
-    toast(e ? "Changes applied" : "Restored to original");
+    if (!e) toast("Restored to original");
   };
 
   /* Back / Escape: apply and return to the library — nothing is lost */
@@ -1777,6 +1793,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
           {photo.name}
         </div>
         <div className="spacer" />
+        {busyExport && <div className="topbar-progress">{busyExport}</div>}
         <button
           className="btn ghost"
           title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
@@ -2407,7 +2424,8 @@ export default function App() {
   useEffect(() => {
     if (!NATIVE || !libLoaded) return;
     const t = setTimeout(() => {
-      const serializable = photos.map(({ url, ...rest }) => rest);
+      // previewUrl is a blob: URL scoped to this session — dead on restart
+      const serializable = photos.map(({ url, previewUrl, ...rest }) => rest);
       window.meridian.saveLibrary(serializable, { theme, exportPresets: presets });
     }, 400);
     return () => clearTimeout(t);
@@ -2825,6 +2843,7 @@ export default function App() {
           </>
         )}
         <div className="spacer" />
+        {busyExport && <div className="topbar-progress">{busyExport}</div>}
         <button
           className="btn ghost"
           title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
@@ -2983,6 +3002,7 @@ export default function App() {
           photo={editingPhoto}
           siblings={editorSiblings}
           suppressKeys={!!exportItems}
+          busyExport={busyExport}
           theme={theme}
           onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
           onClose={() => setEditingId(null)}
@@ -3066,8 +3086,7 @@ export default function App() {
         </CtxMenu>
       )}
 
-      {busyExport && <div className="toast">{busyExport}</div>}
-      {toastMsg && !busyExport && (
+      {toastMsg && (
         <div className="toast">
           {toastMsg.text}
           {toastMsg.action && (

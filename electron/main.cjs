@@ -4,6 +4,35 @@ const fs = require("fs");
 const fsp = fs.promises;
 const { pathToFileURL } = require("url");
 
+/* Explicit, not left to package.json field-resolution order: app.getName()
+   (and everything derived from it — app.getPath('userData'), the macOS
+   dock/notification identity) should say "Splicer Lab" deterministically,
+   in both an unpackaged dev run and a real build, rather than depending on
+   Electron reading productName vs. name correctly in every context. Must
+   run before the very first app.getPath('userData') call below. Note: this
+   does NOT rename what macOS shows in the top menu bar during an
+   unpackaged `electron .` dev run — that specific label is read from the
+   generic Electron.app bundle's own Info.plist, a known Electron dev-mode
+   limitation with no code-level fix; only a real packaged build (`npm run
+   dist:mac`, using this project's own productName/appId) shows "Splicer
+   Lab" there. */
+app.setName("Splicer Lab");
+
+/* colorAdjust.mjs is ESM (see the file for why); cache the dynamic import
+   so every bake doesn't re-import it */
+let colorAdjustP = null;
+function getColorAdjust() {
+  if (!colorAdjustP) colorAdjustP = import(pathToFileURL(path.join(__dirname, "colorAdjust.mjs")).href);
+  return colorAdjustP;
+}
+
+/* stampTool.mjs — same ESM/dynamic-import rationale as colorAdjust.mjs */
+let stampToolP = null;
+function getStampTool() {
+  if (!stampToolP) stampToolP = import(pathToFileURL(path.join(__dirname, "stampTool.mjs")).href);
+  return stampToolP;
+}
+
 /* ---------------- file logging ----------------
    One plain-text file per day under userData/logs, so a bug report can
    include a log file instead of a DevTools screenshot. Covers main-process
@@ -21,16 +50,18 @@ function appendLog(line) {
 process.on("uncaughtException", (err) => appendLog(`[main] uncaughtException: ${err?.stack || err}`));
 process.on("unhandledRejection", (reason) => appendLog(`[main] unhandledRejection: ${reason?.stack || reason}`));
 
-/* one-time migration: userData lives at Application Support/<productName>,
-   so renaming the app from Meridian to Splicer would otherwise point every
-   user at a fresh, empty folder — losing their library.json (watched
-   folders, ratings, crops, presets) and forcing every RAW/HEIC file to
-   reconvert. If Splicer's folder has no library yet but a Meridian one
-   exists alongside it, adopt its contents instead of leaving them orphaned. */
-(function migrateUserData() {
+/* one-time migration: userData lives at Application Support/<app name>, so
+   any rename of the app would otherwise point every user at a fresh, empty
+   folder — losing their library.json (watched folders, ratings, crops,
+   presets) and forcing every RAW/HEIC file to reconvert. If the CURRENT
+   folder has no library yet but an old-name one exists alongside it,
+   adopt its contents instead of leaving them orphaned. Tries every prior
+   name this app has ever resolved to, oldest first, stopping at the first
+   one that actually has a library to adopt. */
+function adoptOldUserData(oldName) {
   const newDir = app.getPath("userData");
   if (fs.existsSync(path.join(newDir, "library.json"))) return;
-  const oldDir = path.join(path.dirname(newDir), "Meridian");
+  const oldDir = path.join(path.dirname(newDir), oldName);
   if (!fs.existsSync(path.join(oldDir, "library.json"))) return;
   try {
     fs.mkdirSync(newDir, { recursive: true });
@@ -39,7 +70,13 @@ process.on("unhandledRejection", (reason) => appendLog(`[main] unhandledRejectio
       if (!fs.existsSync(dest)) fs.renameSync(path.join(oldDir, name), dest);
     }
   } catch {}
-})();
+}
+adoptOldUserData("Meridian"); // pre-Splicer name
+// this file didn't call app.setName() before now, so Electron's own
+// default (package.json's "name" field, NOT "productName") is what any
+// existing dev install's userData folder actually used — adopt from there
+// now that setName("Splicer Lab") above changes the resolved folder.
+adoptOldUserData("splicer-lab");
 
 const NATIVE_RE = /\.(jpe?g|png|webp|gif|avif|bmp)$/i;   // Chromium decodes these itself
 const TIFF_RE = /\.(tif|tiff)$/i;
@@ -53,6 +90,22 @@ const libFile = () => path.join(app.getPath("userData"), "library.json");
 const convCacheDir = () => path.join(app.getPath("userData"), "converted");
 const thumbCacheDir = () => path.join(app.getPath("userData"), "thumbs");
 const proxyCacheDir = () => path.join(app.getPath("userData"), "proxies");
+const previewCacheDir = () => path.join(app.getPath("userData"), "previews");
+
+/* single-photo export folder, remembered across restarts (not just within
+   a session) so re-exporting the same photo later suggests an already-
+   unique name instead of colliding and triggering the OS's native
+   "replace?" prompt */
+const exportStateFile = () => path.join(app.getPath("userData"), "export-state.json");
+let lastExportDir = null;
+try {
+  const s = JSON.parse(fs.readFileSync(exportStateFile(), "utf8"));
+  if (s && typeof s.lastExportDir === "string") lastExportDir = s.lastExportDir;
+} catch {}
+function setLastExportDir(dir) {
+  lastExportDir = dir;
+  try { fs.writeFileSync(exportStateFile(), JSON.stringify({ lastExportDir: dir })); } catch {}
+}
 
 
 /* editor proxy: ~3200px working copy. The editor never touches the
@@ -116,6 +169,18 @@ async function thumbFor(p) {
   })().finally(() => thumbInflight.delete(out));
   thumbInflight.set(out, job);
   return job;
+}
+
+/* on-disk cache for the small edited (crop/color/stamp) preview JPEG the
+   renderer already bakes for the library grid + filmstrip thumbnail
+   (App.jsx's bakePreview). That bake itself stays in the renderer (canvas
+   API, already correct, no reason to duplicate it in Node) — this just
+   persists its output keyed the same way as thumbFor/proxyFor (original
+   file's path+size+mtime), so a fresh app launch can show it immediately
+   instead of every edited-but-not-yet-reopened photo falling back to its
+   plain unedited thumbnail until the user reopens it. */
+function previewCacheKey(p, st) {
+  return crypto.createHash("md5").update(`pv|${p}|${st.size}|${st.mtimeMs}`).digest("hex");
 }
 
 /* ---------------- TIFF / RAW / HEIC → displayable JPEG/PNG ----------------
@@ -362,7 +427,7 @@ function createWindow() {
     minWidth: 940,
     minHeight: 620,
     backgroundColor: "#0B0C0F",
-    title: "Splicer",
+    title: "Splicer Lab",
     icon: path.join(__dirname, "..", "build", "icon.png"),
     autoHideMenuBar: true,
     webPreferences: {
@@ -402,6 +467,17 @@ app.whenReady().then(() => {
       if (query && query.includes("proxy")) {
         const pr = await proxyFor(p);
         return net.fetch(pathToFileURL(pr).toString());
+      }
+      if (query && query.includes("preview")) {
+        // unlike thumb/proxy, never generate one here — this only ever
+        // serves a preview a past editing session already baked and saved
+        // via cache-edit-preview below; if none exists, the caller (load-
+        // library) simply doesn't set previewUrl and the UI falls back to
+        // the plain thumbnail.
+        const st = await fsp.stat(p);
+        const cached = path.join(previewCacheDir(), previewCacheKey(p, st) + ".jpg");
+        if (fs.existsSync(cached)) return net.fetch(pathToFileURL(cached).toString());
+        return new Response("no cached preview", { status: 404 });
       }
       if (NATIVE_RE.test(p)) return net.fetch(pathToFileURL(p).toString());
       const converted = await convertOnce(p);
@@ -529,7 +605,22 @@ ipcMain.handle("load-library", async () => {
         it.sizeBytes = st.size;      // always refresh: the file may have
         it.size = st.size;           // been replaced on disk since import
         it.mtime = st.mtimeMs;
-        delete it.previewUrl;        // blob: URL from a past session — dead on arrival
+        delete it.previewUrl;        // blob/data: URL from a past session — dead on arrival
+        if (it.edits) {
+          // if a previous session cached this photo's baked preview to disk
+          // (cache-edit-preview below), serve it immediately instead of
+          // leaving previewUrl unset — otherwise every edited photo the
+          // user hasn't reopened yet in THIS session shows its plain
+          // unedited thumbnail until they do. `v=` busts the renderer's own
+          // image cache if the cached file is later overwritten with a
+          // newer edit while pointing at this same key.
+          try {
+            const key = previewCacheKey(it.path, st);
+            const cached = path.join(previewCacheDir(), key + ".jpg");
+            const cst = fs.statSync(cached);
+            it.previewUrl = `photo://${encodeURIComponent(it.path)}?preview&k=${key}&v=${cst.mtimeMs}`;
+          } catch {}
+        }
         allowedFiles.add(it.path);
         alive.push(it);
       } catch {
@@ -548,6 +639,30 @@ ipcMain.handle("save-library", async (_e, items, settings) => {
   try {
     const payload = { items, watchedRoots: [...watchers.keys()], settings: settings || {} };
     await fsp.writeFile(libFile(), JSON.stringify(payload), "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+});
+
+/* persist App.jsx's bakePreview() output (a data:image/jpeg;base64,... URL)
+   to disk, keyed like thumbFor/proxyFor — see previewCacheKey above. Called
+   fire-and-forget every time the renderer computes a fresh preview, so
+   load-library can serve it back on the next launch without recomputing
+   anything. dataUrl === null means edits were cleared — drop the stale
+   cached file rather than leave an orphaned one behind. */
+ipcMain.handle("cache-edit-preview", async (_e, filePath, dataUrl) => {
+  try {
+    const st = await fsp.stat(filePath);
+    const out = path.join(previewCacheDir(), previewCacheKey(filePath, st) + ".jpg");
+    if (!dataUrl) {
+      await fsp.unlink(out).catch(() => {});
+      return true;
+    }
+    const m = /^data:image\/jpeg;base64,(.+)$/.exec(dataUrl);
+    if (!m) return false;
+    await fsp.mkdir(previewCacheDir(), { recursive: true });
+    await fsp.writeFile(out, Buffer.from(m[1], "base64"));
     return true;
   } catch {
     return false;
@@ -578,8 +693,21 @@ async function bakeRaw(item, scalePct) {
     .rotate()
     .raw()
     .toBuffer({ resolveWithObject: true });
-  let base = oriented;
   const e = item.edits;
+  // Clone stamp, then color adjust — same full-res, EXIF-oriented,
+  // pre-rotate/crop buffer, the one frame stable regardless of whatever
+  // crop/rotate/scale choices follow, exactly mirroring how qcx/qcy/cw/ch
+  // are themselves defined relative to this same pre-rotate frame. `e.heal`
+  // is read as a fallback for photos saved before the heal->clone-stamp
+  // rename (old data under the old field name, not the removed automatic
+  // Heal tool's own `e.fill`, which is simply never read anymore — any
+  // leftover `edits.fill` on an old photo is inert dead data now).
+  const stampData = e && (e.stamp || e.heal);
+  if (stampData && stampData.length) {
+    const { applyStampToRGBBuffer } = await getStampTool();
+    applyStampToRGBBuffer(oriented.data, oriented.info.width, oriented.info.height, oriented.info.channels, stampData);
+  }
+  let base = oriented;
   let cw = base.info.width, ch = base.info.height, cx = cw / 2, cy = ch / 2;
   if (e) {
     if (Math.abs(e.theta) > 0.01) {
@@ -608,7 +736,12 @@ async function bakeRaw(item, scalePct) {
   }).extract({ left, top, width: cw, height: ch });
   const outW = Math.max(1, Math.round(cw * (scalePct / 100)));
   if (outW !== cw) pipe = pipe.resize(outW);
-  return pipe.raw().toBuffer({ resolveWithObject: true });
+  const rawObj = await pipe.raw().toBuffer({ resolveWithObject: true });
+  if (e && e.adjust) {
+    const { applyAdjustToRGBBuffer } = await getColorAdjust();
+    applyAdjustToRGBBuffer(rawObj.data, rawObj.info.width, rawObj.info.height, rawObj.info.channels, e.adjust);
+  }
+  return rawObj;
 }
 
 function encoderFor(rawObj, format, meta) {
@@ -819,16 +952,16 @@ ipcMain.handle("export-photos", async (event, items, opts) => {
   const ext = opts.format === "webp" ? "webp" : "jpg";
   if (!dir) {
     if (items.length === 1) {
-      const res = await dialog.showSaveDialog({
-        title: "Export photo",
-        defaultPath: buildExportName(items[0], opts.template, ext),
-      });
+      const name = buildExportName(items[0], opts.template, ext);
+      const defaultPath = lastExportDir ? uniquePath(lastExportDir, name) : name;
+      const res = await dialog.showSaveDialog({ title: "Export photo", defaultPath });
       if (res.canceled || !res.filePath) return { canceled: true };
       const raw = await bakeCached(items[0], opts.scale);
       const meta = opts.keepExif ? await exifMetaFor(items[0].path) : null;
       const enc = await encodeToTarget(raw, opts.format, opts.targetMB * 1024 * 1024, meta);
       await fsp.writeFile(res.filePath, enc.buf);
-      return { ok: true, dir: path.dirname(res.filePath), exported: 1 };
+      setLastExportDir(path.dirname(res.filePath));
+      return { ok: true, dir: lastExportDir, exported: 1 };
     }
     const res = await dialog.showOpenDialog({
       title: "Choose export folder",

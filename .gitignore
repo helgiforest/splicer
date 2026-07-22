@@ -1,5 +1,6 @@
 node_modules/
 dist/
 release/
+debug.log
 .DS_Store
 Thumbs.db

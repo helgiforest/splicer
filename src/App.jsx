@@ -1,4 +1,8 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from "react";
+import {
+  defaultAdjust, isDefaultAdjust, compileAdjust, applyAdjustToRGBBuffer,
+} from "../electron/colorAdjust.mjs";
+import { isEmptyStamp, applyStampToRGBBuffer, normalizeStamp } from "../electron/stampTool.mjs";
 
 /* ============================================================
    SPLICER — a focused photo tool (desktop build)
@@ -15,6 +19,68 @@ const photoURL = (absPath) => `photo://${encodeURIComponent(absPath)}`;
 const thumbURL = (p) => (NATIVE && p.path ? `${photoURL(p.path)}?thumb` : p.url);
 const proxyURL = (p) => (NATIVE && p.path ? `${photoURL(p.path)}?proxy` : p.url);
 const PROXY_LONG = 3200;
+
+/* Photos at or under this file size skip the proxy + deep-zoom-tile system
+   entirely in the editor: the whole original loads straight away and the
+   editor works against it directly, so there's no lower-resolution proxy
+   ceiling for a deep-zoom tile to ever need to patch in — which also means
+   no tile ever swaps in, sidestepping that swap-in's inherent glimpse-of-
+   the-old-tile glitch for anything this size or smaller (see
+   feedback_stale_pristine_buffer_race.md — that race is fixed, but a
+   proxy/native resolution jump on tile arrival is still an inherent part of
+   the tile system, not a bug). Sized in MB (not megapixels) on purpose —
+   scanner output is what this threshold is tuned against, and different
+   scanners land at different file sizes for similar resolutions depending
+   on their own JPEG settings; 30 MB comfortably covers this library's
+   scanners (~9-11 MB and ~26 MB) without asking a modest machine to keep a
+   much larger original decoded and resident during editing. */
+const FULL_RES_SIZE_LIMIT = 30 * 1024 * 1024;
+const isFullResEligible = (p) => p.sizeBytes > 0 && p.sizeBytes <= FULL_RES_SIZE_LIMIT;
+const editSrcURL = (p) => {
+  if (!NATIVE || !p.path) return p.url;
+  return isFullResEligible(p) ? photoURL(p.path) : `${photoURL(p.path)}?proxy`;
+};
+
+/* Clone-stamp stroke geometry (electron/stampTool.mjs) is stored in absolute
+   original-image pixel coordinates. bakePreview/bakeCanvas bake the crop/
+   rotate/scale transform directly into the output pixel buffer via a single
+   canvas-transform + drawImage (no separate "pre-rotate" raster stage the
+   way main.cjs's bakeRaw has) — so stamp strokes have to be forward-projected
+   through that same transform before applyStampToRGBBuffer can run on the
+   final buffer. `s` is output-px per original-crop-px (== outW / e.cw,
+   already computed by both callers); origW/origH is the full original
+   image's own pixel size, matching the frame qcx/qcy are defined in. Each
+   stroke's (dx, dy) is a relative offset vector (source − destination), not
+   a point, so it only goes through rotation + scale, never the translation
+   part of the transform. */
+function mapStampStrokes(stamp, origW, origH, e, s, outW, outH) {
+  if (isEmptyStamp(stamp)) return stamp;
+  const t = rad(e.theta);
+  const project = (x, y) => {
+    const relX = x - origW / 2 - e.qcx;
+    const relY = y - origH / 2 - e.qcy;
+    const [ox, oy] = rot(relX, relY, t);
+    return [outW / 2 + s * ox, outH / 2 + s * oy];
+  };
+  return normalizeStamp(stamp).map((stroke) => {
+    const [ndx, ndy] = rot(stroke.dx, stroke.dy, t);
+    return {
+      dx: ndx * s, dy: ndy * s,
+      radius: stroke.radius * s,
+      feather: stroke.feather,
+      opacity: stroke.opacity,
+      points: stroke.points.map((p) => {
+        const [x, y] = project(p.x, p.y);
+        if (p.dx === undefined) return { x, y };
+        // per-dab offset override (see stampTool.mjs header) — same
+        // rotation+scale treatment as the stroke's own dx/dy, since it's
+        // also a relative offset vector, not a point.
+        const [pdx, pdy] = rot(p.dx, p.dy, t);
+        return { x, y, dx: pdx * s, dy: pdy * s };
+      }),
+    };
+  });
+}
 
 /* bake a small edited preview from the PROXY (fast even for 200-MP files) */
 async function bakePreview(srcUrl, origW, origH, edits, maxDim = 560) {
@@ -40,10 +106,31 @@ async function bakePreview(srcUrl, origW, origH, edits, maxDim = 560) {
     ctx.rotate(rad(e.theta));
     ctx.translate(-e.qcx * s0, -e.qcy * s0);
     ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+    const stampData = e.stamp || e.heal;
+    if (!isEmptyStamp(stampData) || !isDefaultAdjust(e.adjust)) {
+      const id = ctx.getImageData(0, 0, outW, outH);
+      if (!isEmptyStamp(stampData)) {
+        applyStampToRGBBuffer(id.data, outW, outH, 4, mapStampStrokes(stampData, origW, origH, e, s, outW, outH));
+      }
+      if (!isDefaultAdjust(e.adjust)) {
+        applyAdjustToRGBBuffer(id.data, outW, outH, 4, e.adjust);
+      }
+      ctx.putImageData(id, 0, 0);
+    }
     return canvas.toDataURL("image/jpeg", 0.82);
   } catch {
     return null;
   }
+}
+
+/* persist bakePreview()'s output to disk (main.cjs's previews/ cache dir,
+   keyed like thumbFor/proxyFor) so the NEXT app launch can show an edited
+   photo's real preview immediately, instead of every edited-but-not-yet-
+   reopened photo falling back to its plain unedited thumbnail until the
+   user opens it again this session. Fire-and-forget: a failed write just
+   means next launch falls back to the plain thumbnail, same as today. */
+function cachePreviewToDisk(path, dataUrl) {
+  if (NATIVE) window.meridian.cacheEditPreview(path, dataUrl).catch(() => {});
 }
 const isUnder = (p, root) => {
   if (!p || !root) return false;
@@ -103,6 +190,13 @@ const CSS = `
   --dim: rgba(238,239,242,.8);
 }
 button { font-family: inherit; cursor: pointer; }
+/* a button clicked with a mouse shouldn't keep a visible focus ring
+   afterward — :focus-visible already limits the BROWSER's own ring to
+   keyboard navigation in modern engines, but belt-and-suspenders here
+   since this app also blurs buttons after a mouse click in JS (see App's
+   mount effect) specifically so a stray Space/Enter afterward can't
+   silently re-trigger whatever was last clicked. */
+button:focus:not(:focus-visible) { outline: none; }
 input, select { font-family: inherit; }
 
 /* ---------- top bar ---------- */
@@ -165,6 +259,17 @@ input, select { font-family: inherit; }
   padding: 14px 10px;
   overflow-y: auto;
 }
+.sidebar-resize {
+  flex-shrink: 0; width: 6px; margin-left: -3px;
+  cursor: ew-resize; position: relative; z-index: 1;
+  touch-action: none;
+}
+.sidebar-resize::after {
+  content: ""; position: absolute; top: 50%; left: 50%;
+  height: 32px; width: 3px; border-radius: 2px;
+  background: var(--stroke-soft); transform: translate(-50%, -50%);
+}
+.sidebar-resize:hover::after, .sidebar-resize:active::after { background: var(--accent); }
 .side-label {
   font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
   color: var(--faint); padding: 14px 10px 6px;
@@ -244,7 +349,7 @@ input, select { font-family: inherit; }
 
 /* ---------- metadata panel ---------- */
 .meta {
-  width: 236px; flex-shrink: 0;
+  width: 264px; flex-shrink: 0;
   border-left: 1px solid var(--stroke-soft); background: var(--surface);
   padding: 16px 16px 12px; overflow-y: auto; font-size: 12px;
 }
@@ -256,8 +361,47 @@ input, select { font-family: inherit; }
 .meta .mrow { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; }
 .meta .mrow .k { color: var(--faint); flex-shrink: 0; }
 .meta .mrow .v { color: var(--text); font-family: var(--mono); font-size: 11.5px; text-align: right; overflow-wrap: anywhere; }
-.meta .fname { color: var(--text); font-size: 12.5px; overflow-wrap: anywhere; line-height: 1.4; margin-bottom: 2px; }
 .meta .divider { height: 1px; background: var(--stroke-soft); margin: 14px 0; }
+
+/* ---------- develop panel: histogram + adjust sliders ---------- */
+/* fixed dark background regardless of theme: the chart's additive RGB
+   blend needs a dark backdrop for contrast (washes out near-white), same
+   convention real photo apps use for the histogram specifically */
+/* Background is a fixed dark charcoal regardless of app theme — deliberate,
+   same convention every other photo editor's histogram uses, since the
+   additive red/green/blue curves read cleanly against dark and would wash
+   out against a light panel. On the light theme specifically, though, a
+   plain background color with no border let the box's own edges (bottom
+   edge included) blend into the light theme's own DevelopPanel background
+   with no visible boundary — the border makes the box's extent legible in
+   either theme instead of relying on a background-color contrast that
+   only exists in one of them. */
+.histogram { width: 100%; height: 84px; display: block; border-radius: 4px; background: #14161B; border: 1px solid var(--stroke-soft); box-sizing: border-box; }
+.adj-row { margin-bottom: 12px; }
+.adj-row:last-child { margin-bottom: 0; }
+.adj-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px; }
+.adj-label { color: var(--muted); font-size: 12px; }
+.adj-val {
+  font-family: var(--mono); font-size: 11.5px; color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+.adj-val.nonzero { color: var(--accent); }
+.adj-slider { position: relative; height: 20px; display: flex; align-items: center; }
+.adj-slider .notch {
+  position: absolute; left: 50%; top: 0; width: 1px; height: 6px;
+  background: var(--faint); transform: translateX(-50%); pointer-events: none;
+}
+input[type="range"].adj {
+  -webkit-appearance: none; position: relative; width: 100%; height: 3px;
+  border-radius: 2px; outline: none; background: var(--faint);
+}
+input[type="range"].adj::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+  background: #fff; border: none; box-shadow: 0 1px 4px rgba(0,0,0,.5); cursor: pointer;
+}
+input[type="range"].adj::-moz-range-thumb {
+  width: 14px; height: 14px; border-radius: 50%; background: #fff; border: none; cursor: pointer;
+}
 
 .stars { display: inline-flex; gap: 2px; }
 .stars button {
@@ -270,6 +414,17 @@ input, select { font-family: inherit; }
 .stars.readonly button { font-size: 9px; padding: 0; }
 
 /* ---------- filmstrip ---------- */
+.filmstrip-resize {
+  flex-shrink: 0; height: 6px; margin-top: -3px;
+  cursor: ns-resize; position: relative; z-index: 1;
+  touch-action: none;
+}
+.filmstrip-resize::after {
+  content: ""; position: absolute; left: 50%; top: 50%;
+  width: 32px; height: 3px; border-radius: 2px;
+  background: var(--stroke-soft); transform: translate(-50%, -50%);
+}
+.filmstrip-resize:hover::after, .filmstrip-resize:active::after { background: var(--accent); }
 .filmstrip {
   flex-shrink: 0; height: 92px;
   border-top: 1px solid var(--stroke-soft); background: var(--strip);
@@ -298,12 +453,21 @@ input, select { font-family: inherit; }
   position: absolute; left: 0; right: 0; bottom: 0;
   background: linear-gradient(transparent, rgba(0,0,0,.75));
   padding: 10px 5px 3px; display: flex; justify-content: space-between; align-items: flex-end;
-  font-size: 9px; font-family: var(--mono); color: rgba(255,255,255,.85);
+  /* scales with the resizable filmstrip's own height (--strip-h, set on
+     .filmstrip) instead of a flat 9px — otherwise a bigger panel just
+     makes the thumbnails bigger while this text stays pinned at its
+     smallest size, reading as proportionally MORE cramped, not less. */
+  font-size: clamp(9px, calc(var(--strip-h, 92px) * 0.1), 16px);
+  font-family: var(--mono); color: rgba(255,255,255,.85);
 }
-.strip-item .sstars { color: var(--accent); letter-spacing: -1px; font-size: 9px; }
+.strip-item .sstars { color: var(--accent); letter-spacing: -1px; font-size: clamp(9px, calc(var(--strip-h, 92px) * 0.1), 16px); }
 .strip-item .sedit {
   position: absolute; top: 4px; right: 4px; width: 6px; height: 6px;
   border-radius: 50%; background: var(--accent);
+  /* a dark ring so the dot still reads as its own badge on the currently-
+     open photo, whose whole thumbnail already has an accent-colored
+     outline right next to this same corner */
+  box-shadow: 0 0 0 1.5px rgba(0,0,0,.6);
 }
 
 /* sidebar sync toggle */
@@ -352,9 +516,21 @@ input, select { font-family: inherit; }
 .anim .imgspace { transition: transform .32s cubic-bezier(.3,.9,.3,1); will-change: transform; }
 .world { position: absolute; inset: 0; transform-origin: 0 0; }
 
+.stamp-overlay { position: absolute; inset: 0; cursor: none; touch-action: none; }
+.stamp-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.stamp-cursor {
+  position: absolute; border-radius: 50%; box-sizing: border-box;
+  border: 1.5px solid rgba(255,255,255,.9); box-shadow: 0 0 0 1px rgba(0,0,0,.5);
+  pointer-events: none; transform: translate(-50%, -50%);
+}
+.stamp-hit { position: absolute; border-radius: 50%; cursor: move; }
+.stamp-handle {
+  position: absolute; width: 10px; height: 10px; border-radius: 50%;
+  background: #f3c34f; border: 1px solid rgba(0,0,0,.5); cursor: nesw-resize;
+}
 
-.thirds { position: absolute; inset: 0; opacity: 0; transition: opacity .18s; pointer-events: none; }
-.thirds.on { opacity: 1; }
+
+.thirds { position: absolute; inset: 0; pointer-events: none; }
 .thirds .v, .thirds .h { position: absolute; background: rgba(255,255,255,.35); }
 .thirds .v { top: 0; bottom: 0; width: 1px; }
 .thirds .h { left: 0; right: 0; height: 1px; }
@@ -412,8 +588,8 @@ input, select { font-family: inherit; }
 .rot-slider { flex: 1; position: relative; height: 26px; display: flex; align-items: center; }
 .rot-slider .notch { position: absolute; left: 50%; top: 0; width: 1px; height: 7px; background: var(--faint); }
 input[type="range"].rot {
-  -webkit-appearance: none; width: 100%; height: 3px; border-radius: 2px;
-  background: var(--stroke); outline: none;
+  -webkit-appearance: none; position: relative; width: 100%; height: 3px; border-radius: 2px;
+  background: var(--faint); outline: none;
 }
 input[type="range"].rot::-webkit-slider-thumb {
   -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%;
@@ -694,6 +870,17 @@ async function bakeCanvas(photo, edits, scalePct = 100, maxDim = Infinity) {
   ctx.rotate(rad(e.theta));
   ctx.translate(-e.qcx, -e.qcy);
   ctx.drawImage(img, -iw / 2, -ih / 2);
+  const stampData = e.stamp || e.heal;
+  if (!isEmptyStamp(stampData) || !isDefaultAdjust(e.adjust)) {
+    const id = ctx.getImageData(0, 0, outW, outH);
+    if (!isEmptyStamp(stampData)) {
+      applyStampToRGBBuffer(id.data, outW, outH, 4, mapStampStrokes(stampData, iw, ih, e, s, outW, outH));
+    }
+    if (!isDefaultAdjust(e.adjust)) {
+      applyAdjustToRGBBuffer(id.data, outW, outH, 4, e.adjust);
+    }
+    ctx.putImageData(id, 0, 0);
+  }
   return canvas;
 }
 
@@ -949,18 +1136,249 @@ function Stars({ value = 0, onChange, readonly }) {
   );
 }
 
-function MetaPanel({ photo, outW, outH, theta, onRate, exif }) {
+/* ---------- live RGB histogram ----------
+   Caches one small (~480px-long-edge) downsampled RGBA buffer per photo
+   PER CROP (drawn from the proxy image with the exact same crop/rotate
+   canvas transform bakePreview uses — see sampleCroppedRGBBuffer — so the
+   histogram reflects what the crop rectangle actually contains, not the
+   whole original frame), then on every adjust change re-runs the shared
+   CPU applyAdjustToRGBBuffer over that small buffer and rebins — cheap
+   enough (tens of thousands of pixels) to redo on every slider tick. */
+
+/* A real Gaussian kernel, not a fixed small hand-written tap list — lets
+   sigma/radius be tuned directly rather than guessing a bigger tap array.
+   A raw per-value histogram of GAIN-STRETCHED 8-bit data is genuinely
+   comb-shaped (stretching 256 discrete input levels by, say, exposureGain
+   > 1 means some output bins are mathematically unreachable by any input
+   — real empty gaps, not noise, worse the harder any slider pushes) —
+   every serious histogram display (Lightroom, Photoshop, Capture One
+   included) smooths its bins before drawing for exactly this reason. An
+   earlier, narrower 5-tap kernel here (effectively sigma≈1) turned out to
+   still look "scattered" at even a small +5% exposure push per direct
+   user testing — sigma=2.2/radius=6 is wide enough to read as a clean,
+   continuous curve at any slider position while still preserving the
+   distribution's real macro-shape (it doesn't reach far enough to blur
+   separate major peaks into each other). Real clipping at 0/255 is
+   reported separately, from the UNsmoothed raw counts (see clipFrac
+   below) — smoothing would otherwise mute a hard clip spike into looking
+   like "some pixels are bright," not "these are actually clipped." */
+function gaussianKernel(sigma, radius) {
+  const k = new Float64Array(radius * 2 + 1);
+  let sum = 0;
+  for (let i = -radius; i <= radius; i++) {
+    const v = Math.exp(-(i * i) / (2 * sigma * sigma));
+    k[i + radius] = v;
+    sum += v;
+  }
+  for (let i = 0; i < k.length; i++) k[i] /= sum;
+  return k;
+}
+const HIST_SMOOTH_KERNEL = gaussianKernel(2.2, 6);
+
+// Edge-clamped (repeats the boundary bin) rather than treating out-of-
+// range taps as zero, so the 0 and 255 bins don't get artificially
+// shrunk purely from having fewer neighbors to average with.
+function smoothHistBins(arr) {
+  const out = new Float64Array(256);
+  const k = HIST_SMOOTH_KERNEL, radius = (k.length - 1) / 2;
+  for (let i = 0; i < 256; i++) {
+    let sum = 0;
+    for (let j = -radius; j <= radius; j++) sum += arr[Math.min(255, Math.max(0, i + j))] * k[j + radius];
+    out[i] = sum;
+  }
+  return out;
+}
+
+const HIST_SAMPLE_DIM = 480; // long-edge px — wide enough that per-bin counts aren't sparse/noisy before any smoothing even runs
+// a clipped edge bin needs to hold a REAL, visible fraction of the sample
+// to warn about — a handful of naturally pure-black/white pixels (a deep
+// shadow, a specular highlight) exists in almost every photo and isn't
+// what "clipping" means here.
+const HIST_CLIP_FRACTION = 0.004;
+
+/* The histogram's own equivalent of bakePreview's canvas crop/rotate
+   transform (src/App.jsx, same qcx/qcy/theta/cw/ch math) — deliberately a
+   SEPARATE small function, not a shared call, because bakePreview also
+   needs to encode a JPEG for the commit/export path (load-bearing, kept
+   untouched here) while this only ever needs raw pixels for statistics.
+   Keep the transform math hand-in-sync with bakePreview if either changes.
+   `crop` may be null (rect/view not ready yet) — falls back to the whole
+   original frame, same default bakePreview itself uses. */
+async function sampleCroppedRGBBuffer(srcUrl, origW, origH, crop, maxDim) {
+  const img = await loadImage(srcUrl);
+  const s0 = img.naturalWidth / origW;
+  const e = crop || { theta: 0, qcx: 0, qcy: 0, cw: origW, ch: origH, stamp: [] };
+  let outW = e.cw * s0, outH = e.ch * s0;
+  const cap = maxDim / Math.max(outW, outH);
+  if (cap < 1) { outW *= cap; outH *= cap; }
+  outW = Math.max(1, Math.round(outW));
+  outH = Math.max(1, Math.round(outH));
+  const s = outW / e.cw;
+  const canvas = document.createElement("canvas");
+  canvas.width = outW; canvas.height = outH;
+  const ctx = canvas.getContext("2d");
+  ctx.translate(outW / 2, outH / 2);
+  ctx.scale(s / s0, s / s0);
+  ctx.rotate(rad(e.theta));
+  ctx.translate(-e.qcx * s0, -e.qcy * s0);
+  ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+  const id = ctx.getImageData(0, 0, outW, outH);
+  if (!isEmptyStamp(e.stamp)) {
+    applyStampToRGBBuffer(id.data, outW, outH, 4, mapStampStrokes(e.stamp, origW, origH, e, s, outW, outH));
+  }
+  return { data: id.data, w: outW, h: outH };
+}
+
+function Histogram({ srcUrl, iw, ih, crop, adjust }) {
+  const canvasRef = useRef(null);
+  const bufRef = useRef(null);
+  const rafRef = useRef(0);
+
+  const draw = useCallback(() => {
+    const cached = bufRef.current;
+    const canvas = canvasRef.current;
+    if (!cached || !canvas) return;
+    const buf = Uint8ClampedArray.from(cached.data);
+    applyAdjustToRGBBuffer(buf, cached.w, cached.h, 4, adjust);
+    const rRaw = new Uint32Array(256), gRaw = new Uint32Array(256), bRaw = new Uint32Array(256);
+    for (let i = 0; i < buf.length; i += 4) { rRaw[buf[i]]++; gRaw[buf[i + 1]]++; bRaw[buf[i + 2]]++; }
+    const r = smoothHistBins(rRaw), g = smoothHistBins(gRaw), b = smoothHistBins(bRaw);
+    let max = 1;
+    for (let i = 0; i < 256; i++) max = Math.max(max, r[i], g[i], b[i]);
+    const cw = canvas.width, ch = canvas.height;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, cw, ch);
+    ctx.globalCompositeOperation = "lighter";
+    const drawChannel = (arr, color) => {
+      ctx.beginPath();
+      ctx.moveTo(0, ch);
+      for (let i = 0; i < 256; i++) {
+        // sqrt scale: raw counts are extremely peaky, this keeps the
+        // low bins visible instead of one spike and a flat line
+        const v = Math.sqrt(arr[i] / max);
+        ctx.lineTo((i / 255) * cw, ch - v * ch);
+      }
+      ctx.lineTo(cw, ch);
+      ctx.closePath();
+      ctx.fillStyle = color;
+      ctx.fill();
+    };
+    drawChannel(r, "rgba(255,90,90,.75)");
+    drawChannel(g, "rgba(70,220,120,.75)");
+    drawChannel(b, "rgba(90,150,255,.75)");
+    ctx.globalCompositeOperation = "source-over";
+
+    // clipping indicators: a solid red bar flush against the edge whose
+    // bin (0 = black point, 255 = white point) holds a real fraction of
+    // the sample — from the RAW (pre-smoothing) counts specifically, so
+    // smoothing can't mute a genuine clip spike into invisibility.
+    const total = cached.w * cached.h;
+    const clipBarW = Math.max(3, cw * 0.015);
+    if (rRaw[0] + gRaw[0] + bRaw[0] > total * HIST_CLIP_FRACTION) {
+      ctx.fillStyle = "rgba(255,40,40,.9)";
+      ctx.fillRect(0, 0, clipBarW, ch);
+    }
+    if (rRaw[255] + gRaw[255] + bRaw[255] > total * HIST_CLIP_FRACTION) {
+      ctx.fillStyle = "rgba(255,40,40,.9)";
+      ctx.fillRect(cw - clipBarW, 0, clipBarW, ch);
+    }
+  }, [adjust]);
+
+  useEffect(() => {
+    let alive = true;
+    bufRef.current = null;
+    if (!srcUrl || !iw || !ih) return undefined;
+    sampleCroppedRGBBuffer(srcUrl, iw, ih, crop, HIST_SAMPLE_DIM).then((buf) => {
+      if (!alive) return;
+      bufRef.current = buf;
+      draw();
+    }).catch(() => {});
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [srcUrl, iw, ih, crop, draw]);
+
+  useEffect(() => {
+    if (rafRef.current) return undefined;
+    rafRef.current = requestAnimationFrame(() => { rafRef.current = 0; draw(); });
+    return () => { if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = 0; } };
+  }, [adjust, draw]);
+
+  return <canvas ref={canvasRef} className="histogram" width={232} height={84} />;
+}
+
+/* ---------- develop panel: histogram + White Balance / Basic sliders ----------
+   No ML auto-enhance toggle and no gray-point eyedropper — manual sliders only. */
+const ADJUST_GROUPS = [
+  {
+    title: "Color",
+    fields: [
+      { key: "temp", label: "Temperature", grad: "linear-gradient(90deg,#4f8fd9,#e8b23d)" },
+      { key: "tint", label: "Tint", grad: "linear-gradient(90deg,#43b16a,#d6519b)" },
+      { key: "saturation", label: "Saturation" },
+    ],
+  },
+  {
+    title: "Light & Shadows",
+    fields: [
+      { key: "exposure", label: "Exposure" },
+      { key: "contrast", label: "Contrast" },
+      { key: "highlights", label: "Highlights" },
+      { key: "shadows", label: "Shadows" },
+      { key: "whitePoint", label: "White Point" },
+      { key: "blackPoint", label: "Black Point" },
+    ],
+  },
+];
+
+function DevelopPanel({ photo, iw, ih, crop, adjust, onAdjustChange, onSliderStart }) {
+  const setField = (key, v) => onAdjustChange({ ...adjust, [key]: v });
+  return (
+    <>
+      <h4>Histogram</h4>
+      <Histogram srcUrl={proxyURL(photo)} iw={iw} ih={ih} crop={crop} adjust={adjust} />
+      {ADJUST_GROUPS.map((group) => (
+        <div key={group.title}>
+          <div className="divider" />
+          <h4>{group.title}</h4>
+          {group.fields.map((f) => {
+            const v = adjust[f.key] || 0;
+            return (
+              <div className="adj-row" key={f.key}>
+                <div className="adj-head">
+                  <span className="adj-label">{f.label}</span>
+                  <span className={`adj-val ${v !== 0 ? "nonzero" : ""}`}>
+                    {v > 0 ? "+" : ""}{Math.round(v)}%
+                  </span>
+                </div>
+                <div className="adj-slider">
+                  <div className="notch" />
+                  <input
+                    type="range" className="adj" min={-100} max={100} step={1}
+                    value={v}
+                    style={f.grad ? { background: f.grad } : undefined}
+                    onPointerDown={onSliderStart}
+                    onChange={(e) => setField(f.key, parseFloat(e.target.value))}
+                    onDoubleClick={() => setField(f.key, 0)}
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ))}
+    </>
+  );
+}
+
+function MetaPanel({ photo, outW, outH, theta, exif }) {
   const ext = (photo.name.split(".").pop() || "").toUpperCase();
   const mp = ((photo.w * photo.h) / 1e6).toFixed(1);
   const fmtShutter = (v) => (v >= 1 ? `${v}s` : `1/${Math.round(1 / v)}s`);
   const hasExif = exif && (exif.model || exif.iso || exif.exposure || exif.fnumber);
   return (
-    <div className="meta">
-      <h4>Rating</h4>
-      <Stars value={photo.rating || 0} onChange={(v) => onRate(photo.id, v)} />
-      <div className="divider" />
+    <>
       <h4>File</h4>
-      <div className="fname">{photo.name}</div>
+      <div className="mrow"><span className="k">Name</span><span className="v">{photo.name}</span></div>
       {photo.folder && (
         <div className="mrow"><span className="k">Folder</span><span className="v">{photo.folder}</span></div>
       )}
@@ -995,15 +1413,11 @@ function MetaPanel({ photo, outW, outH, theta, onRate, exif }) {
         <div className="mrow"><span className="k">Ratio</span><span className="v">{(outW / outH).toFixed(2)}:1</span></div>
       )}
       <div className="mrow"><span className="k">Angle</span><span className="v">{theta > 0 ? "+" : ""}{theta.toFixed(1)}°</span></div>
-      <div className="divider" />
-      <div style={{ color: "var(--faint)", lineHeight: 1.5, fontSize: 11 }}>
-        Keys 1–5 rate the photo, 0 clears.<br />Scroll on the image to zoom the whole canvas out and see the full photo, or in for precision.
-      </div>
-    </div>
+    </>
   );
 }
 
-function Filmstrip({ items, currentId, onSelect, selectedIds, onToggleSel, onRangeSel, onContext }) {
+function Filmstrip({ items, currentId, onSelect, selectedIds, onToggleSel, onRangeSel, onContext, height }) {
   const ref = useRef(null);
   const anchor = useRef(null);
   useEffect(() => {
@@ -1029,7 +1443,7 @@ function Filmstrip({ items, currentId, onSelect, selectedIds, onToggleSel, onRan
     onSelect(p.id);
   };
   return (
-    <div className="filmstrip" ref={ref}>
+    <div className="filmstrip" ref={ref} style={height ? { height, "--strip-h": `${height}px` } : undefined}>
       {items.map((p, idx) => {
         const isSel = selectedIds?.has(p.id);
         return (
@@ -1074,18 +1488,1052 @@ const swapLabel = (label) => {
 const PAD = 36;
 const MIN_CROP = 64;
 
-function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExportSelected, onRate, selected, onToggleSel, onRangeSel, onContextExport, suppressKeys, theme, onToggleTheme, toast, busyExport }) {
+/* ============================================================
+   GLImage — WebGL-backed drop-in replacement for a plain <img>.
+   Renders the same bitmap `<img>` would, but through a shader that
+   applies the live tone/color adjustment (see electron/colorAdjust.mjs
+   for the CPU twin these uniforms are compiled from). Sized and
+   positioned purely by CSS (className/style), exactly like the <img>
+   it replaces — the parent .imgspace transform math is untouched.
+   ============================================================ */
+const GL_VERT = `
+attribute vec2 a_pos;
+varying vec2 v_uv;
+void main() {
+  v_uv = a_pos * 0.5 + 0.5;
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+/* Live-paint budget: total brush DABS across every stroke on the photo
+   (not stroke count) — a stroke is a path of small circular dabs, so this
+   caps at, e.g., ~6 medium strokes rather than 64 clicks. GLImage recomposites
+   the whole stamp list on the CPU on every change (see below), so this bound
+   keeps that recomposite cheap enough to stay smooth while painting; the CPU
+   export path has no such limit. Enforced at paint time (StampOverlay). */
+const MAX_STAMP_DABS = 300;
+
+const GL_FRAG = `
+precision mediump float;
+uniform sampler2D u_tex;
+uniform float u_wbGainR, u_wbGainG, u_wbGainB;
+uniform float u_satGain;
+uniform float u_exposureGain;
+uniform float u_contrastAmt;
+uniform float u_highlightGain;
+uniform float u_shadowGain;
+uniform float u_whiteShift;
+uniform float u_blackShift;
+varying vec2 v_uv;
+
+float smoothstepClamp(float e0, float e1, float x) {
+  float t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+void main() {
+  vec3 c = texture2D(u_tex, v_uv).rgb;
+
+  /* KEEP IN SYNC WITH electron/colorAdjust.mjs adjustPixel() */
+  c *= vec3(u_wbGainR, u_wbGainG, u_wbGainB);
+
+  float gray0 = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  c = gray0 + (c - gray0) * u_satGain;
+
+  c *= u_exposureGain;
+  c = (c - 0.5) * (1.0 + u_contrastAmt) + 0.5;
+
+  float lumH = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  float hd = smoothstepClamp(0.35, 1.0, lumH) * u_highlightGain;
+  c += hd >= 0.0 ? hd * (1.0 - c) : hd * c;
+  float lumS = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  float sd = (1.0 - smoothstepClamp(0.0, 0.5, lumS)) * u_shadowGain;
+  c += sd >= 0.0 ? sd * (1.0 - c) : sd * c;
+
+  float lo = u_blackShift, hi = 1.0 - u_whiteShift;
+  c = (c - lo) / max(0.05, hi - lo);
+
+  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+}`;
+
+function compileGLShader(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    const msg = `GLImage shader compile error: ${gl.getShaderInfoLog(sh)}`;
+    console.error(msg);
+    if (typeof window !== "undefined" && window.meridian?.logError) window.meridian.logError(msg);
+  }
+  return sh;
+}
+
+/* Converts stamp strokes (original-image absolute px) into the pixel space
+   of WHATEVER texture is currently uploaded, given texRegion = {sx, sy, sw}:
+   the original-image-px sub-rectangle that texture depicts (sx=sy=0, sw=iw
+   for the full proxy; tile.sx/sy/sw for a deep-zoom tile). This is what lets
+   the same stamp state render correctly on both the base proxy image and a
+   higher-res tile without Editor needing to know which texture size a given
+   GLImage instance actually uploaded. */
+function mapStampToTexSpace(stamp, texRegion, texW) {
+  if (!stamp || !stamp.length || !texRegion || !texRegion.sw || !texW) return [];
+  const s0 = texW / texRegion.sw;
+  return stamp.map((s) => ({
+    radius: s.radius * s0,
+    dx: s.dx * s0,
+    dy: s.dy * s0,
+    feather: s.feather,
+    opacity: s.opacity,
+    points: s.points.map((p) => ({
+      x: (p.x - texRegion.sx) * s0, y: (p.y - texRegion.sy) * s0,
+      // per-dab offset override (see stampTool.mjs header) — a relative
+      // vector, so only scale applies, same as the stroke-level dx/dy above
+      ...(p.dx !== undefined ? { dx: p.dx * s0, dy: p.dy * s0 } : null),
+    })),
+  }));
+}
+
+function GLImage({ className, style, src, draggable, adjust, stamp, draft, texRegion }) {
+  const canvasRef = useRef(null);
+  const glRef = useRef(null);
+  const texRef = useRef(null);
+  const rafRef = useRef(0);
+  const adjustRef = useRef(adjust);
+  adjustRef.current = adjust;
+  const stampRef = useRef(stamp);
+  stampRef.current = stamp;
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  const texRegionRef = useRef(texRegion);
+  texRegionRef.current = texRegion;
+  const srcRef = useRef(src);
+  srcRef.current = src;
+  const pristineRef = useRef(null); // { src, width, height, data, img } — decoded once per unique `src`
+  const uploadTokenRef = useRef(0);
+  const uploadRafRef = useRef(0);
+
+  const draw = useCallback(() => {
+    const g = glRef.current;
+    const canvas = canvasRef.current;
+    if (!g || !texRef.current || !canvas) return;
+    const { gl } = g;
+    const c = compileAdjust(adjustRef.current);
+    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    gl.useProgram(g.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texRef.current);
+    gl.uniform1i(g.uTex, 0);
+    gl.uniform1f(g.uWbR, c.wbGainR);
+    gl.uniform1f(g.uWbG, c.wbGainG);
+    gl.uniform1f(g.uWbB, c.wbGainB);
+    gl.uniform1f(g.uSat, c.satGain);
+    gl.uniform1f(g.uExp, c.exposureGain);
+    gl.uniform1f(g.uContrast, c.contrastAmt);
+    gl.uniform1f(g.uHi, c.highlightGain);
+    gl.uniform1f(g.uSh, c.shadowGain);
+    gl.uniform1f(g.uWhite, c.whiteShift);
+    gl.uniform1f(g.uBlack, c.blackShift);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }, []);
+
+  const scheduleDraw = useCallback(() => {
+    if (rafRef.current) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = 0;
+      draw();
+    });
+  }, [draw]);
+
+  /* mount-once: WebGL context + program + fullscreen-quad + texture object */
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const gl = canvas.getContext("webgl", { premultipliedAlpha: false });
+    if (!gl) return;
+    const vs = compileGLShader(gl, gl.VERTEX_SHADER, GL_VERT);
+    const fs = compileGLShader(gl, gl.FRAGMENT_SHADER, GL_FRAG);
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      const msg = `GLImage program link error: ${gl.getProgramInfoLog(prog)}`;
+      console.error(msg);
+      if (typeof window !== "undefined" && window.meridian?.logError) window.meridian.logError(msg);
+    }
+    gl.useProgram(prog);
+
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    const posLoc = gl.getAttribLocation(prog, "a_pos");
+    gl.enableVertexAttribArray(posLoc);
+    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    // NPOT textures (our proxy/tile images aren't power-of-two): CLAMP_TO_EDGE
+    // + LINEAR with no mipmaps, or WebGL1 renders black.
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    texRef.current = tex;
+
+    glRef.current = {
+      gl, prog,
+      uTex: gl.getUniformLocation(prog, "u_tex"),
+      uWbR: gl.getUniformLocation(prog, "u_wbGainR"),
+      uWbG: gl.getUniformLocation(prog, "u_wbGainG"),
+      uWbB: gl.getUniformLocation(prog, "u_wbGainB"),
+      uSat: gl.getUniformLocation(prog, "u_satGain"),
+      uExp: gl.getUniformLocation(prog, "u_exposureGain"),
+      uContrast: gl.getUniformLocation(prog, "u_contrastAmt"),
+      uHi: gl.getUniformLocation(prog, "u_highlightGain"),
+      uSh: gl.getUniformLocation(prog, "u_shadowGain"),
+      uWhite: gl.getUniformLocation(prog, "u_whiteShift"),
+      uBlack: gl.getUniformLocation(prog, "u_blackShift"),
+    };
+
+    return () => {
+      const lose = gl.getExtension("WEBGL_lose_context");
+      if (lose) lose.loseContext();
+      glRef.current = null;
+      texRef.current = null;
+    };
+  }, []);
+
+  /* Recomposite (if there are any stamp strokes) + upload the texture,
+     reading the LATEST stamp/draft/texRegion from refs rather than whatever
+     was current when this got scheduled (see scheduleUpload). Stamps are
+     composited on the CPU — via the exact same electron/stampTool.mjs
+     function the export bake paths use — against a pristine pixel buffer
+     decoded once per `src`. This is deliberately NOT a shader-side per-dab
+     loop sampling a single static texture: that would make every stroke's
+     source always read the UNEDITED original, so a second stroke sourcing
+     from an area an earlier stroke had already cloned over would show the
+     old, pre-edit content instead of what's actually on screen.
+
+     `draft` (Editor's in-progress stroke, while a drag is still down — see
+     StampOverlay) gets folded into the SAME composite call, not rendered
+     any other way. It used to drive only an SVG outline while the drag was
+     live, showing literally the untouched original underneath — which
+     read as "looks great while editing" for no reason other than nothing
+     had actually been cloned yet, then looked different the instant the
+     real algorithm ran for the first time at commit. Running the identical
+     function on the identical merged stroke list here means there is no
+     longer a second, different code path to diverge from: what's on
+     screen during the drag IS what gets committed, pixel for pixel. */
+  const uploadTexture = useCallback(() => {
+    const p = pristineRef.current;
+    const g = glRef.current;
+    const canvas = canvasRef.current;
+    // p.src !== srcRef.current: `src` and `texRegion` typically change
+    // together (a deep-zoom tile swapping in brings both a new crop window
+    // AND a new image URL at once), but the new pristine buffer only exists
+    // once its own decode effect finishes — an async step. Without this
+    // check, a texRegion-change here would fire first, this recomposite
+    // would run using the OLD pristine buffer's pixel data, and resize the
+    // canvas to the OLD image's dimensions — while the CSS box driving this
+    // canvas's on-screen position/size has already jumped to the NEW tile's
+    // (different) bounds, since that's driven directly by React state, not
+    // by this decode. The result is one visible frame of the previous
+    // tile's content stretched/repositioned into the new tile's box (looks
+    // like the same photo "blinking" with a shift) before the real decode
+    // lands and the src-decode effect below calls scheduleUpload() again
+    // with the correct buffer.
+    if (!p || !g || !canvas || p.src !== srcRef.current) return;
+    canvas.width = p.width;
+    canvas.height = p.height;
+    g.gl.bindTexture(g.gl.TEXTURE_2D, texRef.current);
+    // fold the in-progress draft stroke into the same list `stamp` itself
+    // will hold once the drag commits — an appended new stroke, or the
+    // relevant existing stroke's own points extended, exactly mirroring
+    // the two branches beginWindowDrag's onUp commits (see StampOverlay).
+    const d = draftRef.current;
+    let strokesForComposite = stampRef.current;
+    if (d && d.points && d.points.length) {
+      strokesForComposite = d.isNew
+        ? [...strokesForComposite, { points: d.points, radius: d.radius, dx: d.dx, dy: d.dy, feather: d.feather, opacity: d.opacity }]
+        : strokesForComposite.map((s, i) => (i === d.index ? { ...s, points: [...s.points, ...d.points] } : s));
+    }
+    const texStamp = mapStampToTexSpace(strokesForComposite, texRegionRef.current, p.width);
+    if (texStamp.length) {
+      const composited = new Uint8ClampedArray(p.data);
+      applyStampToRGBBuffer(composited, p.width, p.height, 4, texStamp);
+      g.gl.texImage2D(g.gl.TEXTURE_2D, 0, g.gl.RGBA, p.width, p.height, 0, g.gl.RGBA, g.gl.UNSIGNED_BYTE, composited);
+    } else {
+      g.gl.texImage2D(g.gl.TEXTURE_2D, 0, g.gl.RGBA, g.gl.RGBA, g.gl.UNSIGNED_BYTE, p.img);
+    }
+    scheduleDraw();
+  }, [scheduleDraw]);
+
+  /* Coalesced via requestAnimationFrame, same idea as scheduleDraw — a fast
+     drag can emit a new dab well under 16ms apart, and recompositing (a
+     typed-array clone + a handful of feathered-circle blends) plus a GPU
+     upload is real CPU work, not a cheap uniform tweak; doing it once per
+     dab rather than once per frame was measured to occasionally run long
+     enough on a large brush to eat into the next pointermove's turn, which
+     is a plausible cause of a drag feeling like it "drops" the gesture
+     partway through. Only the latest stamp state as of the next frame is
+     ever applied — nothing is lost, intermediate dabs just don't each get
+     their own upload. */
+  const scheduleUpload = useCallback(() => {
+    if (uploadRafRef.current) return;
+    uploadRafRef.current = requestAnimationFrame(() => {
+      uploadRafRef.current = 0;
+      uploadTexture();
+    });
+  }, [uploadTexture]);
+
+  /* Decode `src` into a pristine pixel buffer once per unique URL. */
+  useEffect(() => {
+    let alive = true;
+    if (!src) return undefined;
+    const token = ++uploadTokenRef.current;
+    loadImage(src).then((img) => {
+      if (!alive || token !== uploadTokenRef.current) return;
+      const c = document.createElement("canvas");
+      c.width = img.naturalWidth; c.height = img.naturalHeight;
+      const ctx = c.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      pristineRef.current = { src, width: c.width, height: c.height, data: ctx.getImageData(0, 0, c.width, c.height).data, img };
+      scheduleUpload();
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, [src, scheduleUpload]);
+
+  /* Recomposite + reupload whenever the stamp strokes, the in-progress
+     draft stroke, or texRegion change. `draft` changes on every processed
+     pointermove during a drag (see StampOverlay's beginWindowDrag handler)
+     — scheduleUpload's own requestAnimationFrame coalescing (see its own
+     comment above) is what keeps that from recompositing/re-uploading
+     more than once per displayed frame, same as it already does for
+     rapid stamp commits. */
+  useEffect(() => { scheduleUpload(); }, [stamp, draft, texRegion, scheduleUpload]);
+
+  /* redraw (GPU-cheap: uniform update + one quad) on every adjust change */
+  useEffect(() => { scheduleDraw(); }, [adjust, scheduleDraw]);
+
+  useEffect(() => () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    if (uploadRafRef.current) cancelAnimationFrame(uploadRafRef.current);
+  }, []);
+
+  return <canvas ref={canvasRef} className={className} style={style} draggable={draggable} />;
+}
+
+const STAMP_SOURCE_OFFSET_MULT = 2.5; // default source distance, as a multiple of radius
+const STAMP_MIN_RADIUS = 3;           // image-px floor so a stroke never collapses to zero
+const STAMP_DAB_SPACING = 0.5;        // new dab emitted once the pointer has moved radius*this
+const STAMP_SRC_HIT_MIN = 22;         // screen-px floor for the draggable "move source" hit target — a small brush's own visual circle is otherwise too tiny to reliably grab
+
+/* Self-overlap avoidance + auto-feather for the clone stamp — both driven
+   off the same cheap 16-point ring statistic (mean color + variance)
+   sampled from Editor's cached proxy-resolution buffer (editPixelsRef).
+   Deliberately a local search, not a full nearest-neighbor-field search
+   over the whole photo (PatchMatch/content-aware-fill territory) — a
+   different, much bigger algorithm, not a drop-in replacement for
+   "drag a source handle" precision clone-stamping. (Splicer briefly had
+   an automatic Heal brush built on exactly that algorithm; it was
+   removed — Clone Stamp's manual source point proved more reliable in
+   practice, see this project's own memory if reviving it.) */
+const STAMP_OVERLAP_MARGIN = 1.6;     // × radius — how close counts as "overlap" (a dab's feather reaches past its own radius too)
+const STAMP_OFFSET_SEARCH_DEGREES = [15, -15, 30, -30, 45, -45, 60, -60, 75, -75, 90, -90, 105, -105, 120, -120, 135, -135, 150, -150, 165, -165, 180];
+const STAMP_DIST_MULTS = [1, 1.4, 1.8, 2.2, 2.8, 3.5]; // candidate source distances, as a multiple of the stroke's own nominal distance
+const STAMP_DIST_EASE_STEP = 0.15;    // max distance-multiplier change/dab easing back toward 1 (nominal)
+const STAMP_ANGLE_EASE_STEP_DEG = 6;  // max degrees/dab a deviated offset eases back toward the stroke's own nominal angle
+const STAMP_FEATHER_MIN = 0.15;
+const STAMP_FEATHER_MAX = 0.6;
+const STAMP_FEATHER_VARIANCE_NORM = 300; // local color variance at/above this maps to the tightest feather
+const STAMP_INITIAL_ANGLES = [0, 22.5, 45, 67.5, 90, 112.5, 135, 157.5, 180, 202.5, 225, 247.5, 270, 292.5, 315, 337.5];
+
+function angleDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+/* Mean RGB + color variance over a 16-point ring at `radius` around (x,y)
+   (image-space), read from a cached { data, width, height, scale } proxy
+   buffer. Nearest-neighbor sampling (not bilinear) — this only informs a
+   heuristic decision, not the actual blended pixels. Returns null off-buffer. */
+function sampleAreaStats(pixels, x, y, radius) {
+  if (!pixels) return null;
+  const { data, width, height, scale } = pixels;
+  const bx = x * scale, by = y * scale, br = Math.max(1, radius * scale);
+  const N = 16;
+  let sr = 0, sg = 0, sb = 0, sr2 = 0, sg2 = 0, sb2 = 0, n = 0;
+  for (let i = 0; i < N; i++) {
+    const a = (i / N) * Math.PI * 2;
+    const px = Math.round(bx + Math.cos(a) * br), py = Math.round(by + Math.sin(a) * br);
+    if (px < 0 || py < 0 || px >= width || py >= height) continue;
+    const o = (py * width + px) * 4;
+    const r = data[o], g = data[o + 1], b = data[o + 2];
+    sr += r; sg += g; sb += b; sr2 += r * r; sg2 += g * g; sb2 += b * b; n++;
+  }
+  if (!n) return null;
+  const mr = sr / n, mg = sg / n, mb = sb / n;
+  const variance = (sr2 / n - mr * mr + (sg2 / n - mg * mg) + (sb2 / n - mb * mb)) / 3;
+  return { mean: [mr, mg, mb], variance };
+}
+
+/* Chooses a NEW stroke's nominal source-offset DIRECTION (distance stays
+   fixed at STAMP_SOURCE_OFFSET_MULT × radius). Always defaulting to due
+   horizontal is fine when the thing being traced runs roughly vertically
+   (the offset lands beside it, in clean surroundings) but actively wrong
+   when it runs roughly horizontally — a wire, say — since the offset then
+   points ALONG the wire's own length, so the "source" is just more of the
+   same wire (or the pole it runs into), not the clean sky beside it.
+   Candidates are scored by local variance measured AT the candidate
+   itself: a clean patch of background reads as low variance, a patch
+   still sitting on a thin linear feature reads as high variance no matter
+   which color that feature is — so this works without any real edge or
+   orientation detection. Falls back to the old fixed-horizontal default
+   when the proxy buffer isn't ready yet or no candidate clearly wins. */
+function pickInitialOffset(pixels, point, dist, obstacles, radius, iw, ih) {
+  const fallback = { dx: dist, dy: 0 };
+  if (!pixels) return fallback;
+  const overlapsAny = (sx, sy) =>
+    obstacles.some((q) => Math.hypot(sx - q.x, sy - q.y) < Math.max(radius, q.radius) * STAMP_OVERLAP_MARGIN);
+  let best = null, bestScore = Infinity;
+  for (const deg of STAMP_INITIAL_ANGLES) {
+    const angle = (deg * Math.PI) / 180;
+    const cx = point.x + Math.cos(angle) * dist, cy = point.y + Math.sin(angle) * dist;
+    if (cx < 0 || cy < 0 || cx > iw || cy > ih || overlapsAny(cx, cy)) continue;
+    const stats = sampleAreaStats(pixels, cx, cy, radius * 0.6);
+    const score = stats ? stats.variance : 0;
+    if (score < bestScore) { bestScore = score; best = { dx: cx - point.x, dy: cy - point.y }; }
+  }
+  return best || fallback;
+}
+
+/* Picks this dab's source offset, and the effective {angle, distMult} to
+   hand to the NEXT dab's call as `preferred` (both start at the stroke's
+   own nominal angle/distMult=1). `obstacles` is every {x,y,radius} dab
+   that already exists ANYWHERE on the photo — every OTHER stroke's own
+   points (a later stroke's rigid offset can just as easily sample from an
+   earlier, nearby stroke's already-stamped destination as from its own —
+   two wires stamped close together is exactly this) plus this stroke's
+   own points added so far in the SAME drag gesture.
+
+   Three things this deliberately does NOT do, each because an earlier
+   version did and it read as a new, invented artifact rather than a clean
+   removal:
+   1. Score candidates only against the stroke's ORIGINAL nominal angle.
+      That let two adjacent dabs independently jump to two very different
+      candidate angles whenever their own local overlap situations
+      differed slightly — each individually "avoids overlap", but
+      consecutive dabs sampling unrelated patches of the photo reads as
+      banding/ghosting along the stroke. Scoring against `preferred` (what
+      the PREVIOUS dab actually used) instead keeps any deviation as small
+      and as continuous as possible dab-to-dab.
+   2. Snap an already-deviated stroke straight back to nominal the instant
+      it's clear to do so. Instead it eases back gradually — at most
+      STAMP_ANGLE_EASE_STEP_DEG / STAMP_DIST_EASE_STEP per dab — and only
+      if the eased position is itself still clear.
+   3. Treat a ROTATED angle as an equally good fix as a LONGER distance
+      along the SAME angle. Rotating samples a genuinely different part of
+      the photo — risky even once technically non-overlapping (a nearby
+      cloud edge, different lighting). The single most common way this
+      whole thing gets triggered is tracing both edges of a linear defect
+      (a wire) right next to each other to fully cover its width — the
+      return pass is essentially "the same clean patch, just needs to
+      reach a little further" for continuity with the first pass, not a
+      different patch. distMult candidates are scored far cheaper than
+      angle-rotation candidates so that's preferred whenever it's enough. */
+function pickDabOffset(stroke, obstacles, point, preferred, pixels, iw, ih) {
+  const nominalAngle = Math.atan2(stroke.dy, stroke.dx);
+  const nominalDist = Math.hypot(stroke.dx, stroke.dy);
+  if (!(nominalDist > 0)) return { angle: nominalAngle, distMult: 1, dx: stroke.dx, dy: stroke.dy };
+
+  const overlapsAny = (sx, sy) =>
+    obstacles.some((q) => Math.hypot(sx - q.x, sy - q.y) < Math.max(stroke.radius, q.radius) * STAMP_OVERLAP_MARGIN);
+  const at = (angle, distMult) => ({ x: point.x + Math.cos(angle) * nominalDist * distMult, y: point.y + Math.sin(angle) * nominalDist * distMult });
+
+  let { angle, distMult } = preferred;
+  let p = at(angle, distMult);
+  const stillClear = !overlapsAny(p.x, p.y);
+  // only ease toward nominal while the CURRENT, un-eased vector is itself
+  // still comfortably clear — easing regardless of that let it wander
+  // into a boundary it couldn't yet see coming (a wire running
+  // near-parallel to another for a while has a roughly constant safe
+  // region, not a shrinking one), which then needed a fresh search a dab
+  // or two later — a small jump, but an avoidable one.
+  if (stillClear) {
+    const angleGap = angleDiff(nominalAngle, angle), distGap = 1 - distMult;
+    if (Math.abs(angleGap) > 1e-6 || Math.abs(distGap) > 1e-6) {
+      const easedAngle = angle + Math.sign(angleGap) * Math.min(Math.abs(angleGap), (STAMP_ANGLE_EASE_STEP_DEG * Math.PI) / 180);
+      const easedDist = distMult + Math.sign(distGap) * Math.min(Math.abs(distGap), STAMP_DIST_EASE_STEP);
+      const pe = at(easedAngle, easedDist);
+      if (!overlapsAny(pe.x, pe.y)) { angle = easedAngle; distMult = easedDist; p = pe; }
+    }
+    return { angle, distMult, dx: p.x - point.x, dy: p.y - point.y };
+  }
+
+  // the preferred vector itself no longer clears — search near IT, not the
+  // stroke's original nominal angle/distance, so the fix stays local.
+  const destStats = sampleAreaStats(pixels, point.x, point.y, stroke.radius);
+  let best = null, bestScore = Infinity;
+  for (const dm of STAMP_DIST_MULTS) {
+    for (const deg of STAMP_OFFSET_SEARCH_DEGREES) {
+      const cand = preferred.angle + (deg * Math.PI) / 180;
+      const cp = at(cand, dm);
+      if (cp.x < 0 || cp.y < 0 || cp.x > iw || cp.y > ih || overlapsAny(cp.x, cp.y)) continue;
+      let score = Math.abs(deg) + (dm - 1) * 10;
+      const srcStats = destStats && sampleAreaStats(pixels, cp.x, cp.y, stroke.radius);
+      if (destStats && srcStats) {
+        const [dr, dg, db] = destStats.mean, [sr, sg, sb] = srcStats.mean;
+        score += Math.hypot(dr - sr, dg - sg, db - sb) * 0.6;
+      }
+      if (score < bestScore) { bestScore = score; best = { angle: cand, distMult: dm, dx: cp.x - point.x, dy: cp.y - point.y }; }
+    }
+  }
+  // every candidate overlaps SOMETHING (a dense junction where several
+  // strokes converge close together, e.g. wires meeting at a pole) — pick
+  // whichever in-bounds candidate overlaps the LEAST (smallest penetration
+  // past the overlap threshold) rather than silently keep using `preferred`
+  // as-is, which can be the worst possible pick (squarely on top of
+  // another stroke, or on structure that was never a reasonable source).
+  if (!best) {
+    let leastBadPenetration = Infinity;
+    for (const dm of STAMP_DIST_MULTS) {
+      for (const deg of STAMP_OFFSET_SEARCH_DEGREES) {
+        const cand = preferred.angle + (deg * Math.PI) / 180;
+        const cp = at(cand, dm);
+        if (cp.x < 0 || cp.y < 0 || cp.x > iw || cp.y > ih) continue;
+        const penetration = obstacles.reduce((worst, q) => {
+          const threshold = Math.max(stroke.radius, q.radius) * STAMP_OVERLAP_MARGIN;
+          return Math.max(worst, threshold - Math.hypot(cp.x - q.x, cp.y - q.y));
+        }, 0);
+        if (penetration < leastBadPenetration) { leastBadPenetration = penetration; best = { angle: cand, distMult: dm, dx: cp.x - point.x, dy: cp.y - point.y }; }
+      }
+    }
+  }
+  return best || { angle, distMult, dx: p.x - point.x, dy: p.y - point.y };
+}
+
+/* New-stroke feather default: wider on smooth/low-variance surroundings
+   (sky, out-of-focus background — a soft edge disappears easily there),
+   tighter on detailed/high-variance ones (foliage, brick — a wide feather
+   would blur real detail into the blend instead of hiding a seam). Only
+   ever runs once, for a stroke's first dab — later dabs of the same
+   stroke keep whatever this decided, same as a real brush doesn't change
+   softness mid-stroke. */
+function autoFeather(pixels, point, radius, fallback) {
+  const stats = sampleAreaStats(pixels, point.x, point.y, radius);
+  if (!stats) return fallback;
+  const t = Math.min(1, stats.variance / STAMP_FEATHER_VARIANCE_NORM);
+  return STAMP_FEATHER_MAX - t * (STAMP_FEATHER_MAX - STAMP_FEATHER_MIN);
+}
+
+/* Resamples a stroke's own recorded points to a fixed, dense arc-length
+   spacing — purely for feeding strokeRing's disk-union circle centers, never
+   touching stroke.points itself. The PAINTED dab spacing (STAMP_DAB_SPACING)
+   is tuned for the clone algorithm's own cost, not for how smooth a disk
+   union of that many circles looks once zoomed in close — a fast drag can
+   also leave the recorded points coarser than that nominal spacing (the
+   interpolation fills gaps by DISTANCE, but a quick flick can still land
+   points further apart than intended). A disk union needs roughly even,
+   closely-spaced centers to read as one smooth capsule rather than a chain
+   of visibly separate circles — resampling first guarantees that regardless
+   of how the actual paint-time points happened to land. Capped to a max
+   point count so a very long stroke doesn't force rendering thousands of
+   SVG circles. */
+function resampleForOutline(points, radius) {
+  if (points.length < 2) return points;
+  let total = 0;
+  for (let i = 1; i < points.length; i++) {
+    total += Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+  }
+  const MAX_OUTLINE_POINTS = 400;
+  const spacing = Math.max(radius * 0.25, total / MAX_OUTLINE_POINTS);
+  const out = [points[0]];
+  let prev = points[0];
+  let dist = 0;
+  for (let i = 1; i < points.length; i++) {
+    let cur = points[i];
+    let segLen = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+    while (dist + segLen >= spacing) {
+      const t = (spacing - dist) / segLen;
+      prev = { x: prev.x + (cur.x - prev.x) * t, y: prev.y + (cur.y - prev.y) * t };
+      out.push(prev);
+      segLen = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+      dist = 0;
+    }
+    dist += segLen;
+    prev = cur;
+  }
+  out.push(points[points.length - 1]);
+  return out;
+}
+
+/* Clone-stamp brush painting overlay — rendered only in mode === "stamp",
+   as a sibling of the (pointer-events:none) .imgspace/GLImage layers inside
+   the same .viewclip box view mode already uses. `stamp` is an array of
+   brush strokes (electron/stampTool.mjs): { points:[{x,y}], radius, dx, dy }
+   — a path of small circular dabs sharing one radius and one rigid source
+   offset (drag the source handle once, it applies to the whole stroke,
+   same as Photoshop's Clone Stamp / Lightroom's Heal brush).
+   screenToImage/imageToLocal reuse the exact same rot/irot + view.k/theta
+   conversion the crop tool's own drag math and deep-zoom tile fetch use. */
+function StampOverlay({ stamp, setStamp, draft, setDraft, selectedStroke, setSelectedStroke, snapshot, view, rect, iw, ih, stageRef, toast, brushRadius, feather, opacity, gesturing, editPixelsRef }) {
+  const screenToImage = useCallback((clientX, clientY) => {
+    const box = stageRef.current.getBoundingClientRect();
+    const sx = clientX - box.left, sy = clientY - box.top;
+    const [ux, uy] = irot(sx - view.icx, sy - view.icy, rad(view.theta));
+    return { x: ux / view.k + iw / 2, y: uy / view.k + ih / 2 };
+  }, [view, iw, stageRef]);
+
+  const imageToLocal = useCallback((x, y) => {
+    const [ox, oy] = rot(x - iw / 2, y - ih / 2, rad(view.theta));
+    return { left: view.icx + ox * view.k - rect.x, top: view.icy + oy * view.k - rect.y };
+  }, [view, iw, rect]);
+
+  const clampToImage = (x, y) => [Math.min(Math.max(x, 0), iw), Math.min(Math.max(y, 0), ih)];
+
+  /* Space bar = temporary hand tool, same convention as Photoshop/Lightroom:
+     hold it to pan (and double-click to zoom-to-fit) without switching out
+     of the stamp brush. Tracked as a ref (not state) since it changes on
+     every keydown/keyup and doesn't need to trigger a re-render — only the
+     imperative cursor style and the pointer handlers below read it. Scoped
+     to this component's own mount/unmount (only relevant while the stamp
+     overlay is actually showing), so it never needs wiring through Editor. */
+  const spaceRef = useRef(false);
+  const overlayRef = useRef(null);
+  useEffect(() => {
+    const down = (ev) => {
+      if (ev.code !== "Space" || ev.repeat) return;
+      spaceRef.current = true;
+      if (overlayRef.current) overlayRef.current.style.cursor = "grab";
+      hideCursor();
+    };
+    const up = (ev) => {
+      if (ev.code !== "Space") return;
+      spaceRef.current = false;
+      if (overlayRef.current) overlayRef.current.style.cursor = "none";
+    };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* Brush-size cursor preview: a circle matching the current brush radius
+     that follows the pointer, so sizing is visible before the first dab
+     lands. Position is written straight to the DOM on every move (bypasses
+     React state — the same pattern the codebase already uses for drag.current
+     elsewhere) so hovering doesn't cause a re-render per pixel of movement;
+     only the circle's diameter is a normal React-driven style, since that
+     only changes when the brush-size slider or the zoom level changes.
+     Hidden while space is held (hand tool, not painting) or while a wheel/
+     trackpad zoom gesture is in progress — trackpad pinch-zoom can report
+     tiny incidental pointer movement, which otherwise reads as the brush
+     cursor jittering around while the user is only trying to zoom. */
+  const cursorRef = useRef(null);
+  const onOverlayMove = (e) => {
+    const el = cursorRef.current;
+    if (!el) return;
+    if (spaceRef.current || gesturing) { el.style.opacity = "0"; return; }
+    const box = stageRef.current.getBoundingClientRect();
+    const p = screenToImage(e.clientX, e.clientY);
+    // hovering an existing stroke would grab+move it on click, not paint —
+    // show a grab cursor and hide the brush-size circle there instead
+    const overStroke = stamp.some((s) => nearestPointDist(s, p.x, p.y) <= s.radius);
+    if (overlayRef.current) overlayRef.current.style.cursor = overStroke ? "grab" : "none";
+    if (overStroke) { el.style.opacity = "0"; return; }
+    el.style.left = `${e.clientX - box.left - rect.x}px`;
+    el.style.top = `${e.clientY - box.top - rect.y}px`;
+    el.style.opacity = "1";
+  };
+  const showCursor = () => { if (cursorRef.current && !spaceRef.current && !gesturing) cursorRef.current.style.opacity = "1"; };
+  const hideCursor = () => { if (cursorRef.current) cursorRef.current.style.opacity = "0"; };
+
+  // The stroke currently being drawn/extended — kept OUT of `stamp` itself
+  // until pointerup (undo/redo and persistence only ever see a finished
+  // stroke), but lifted up to Editor (not local state here) so the
+  // sibling GLImage instances can fold it into their own live composite —
+  // see GLImage's uploadTexture. Drives the destination-outline preview
+  // below AND, via that lift, the actual live cloned-pixel preview; no
+  // source ring/handles until the stroke commits (those still only make
+  // sense for a finished, selectable stroke).
+  const totalDabs = stamp.reduce((n, s) => n + s.points.length, 0);
+  const nearestPointDist = (stroke, x, y) =>
+    stroke.points.reduce((min, p) => Math.min(min, Math.hypot(p.x - x, p.y - y)), Infinity);
+
+  const updateStroke = (index, patch) => {
+    setStamp((prev) => prev.map((s, i) => (i === index ? { ...s, ...patch } : s)));
+  };
+
+  const beginWindowDrag = (onMove, onUp) => {
+    const move = (ev) => onMove(ev);
+    const up = (ev) => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      if (onUp) onUp(ev);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up, { once: true });
+  };
+
+  const removeStroke = (i) => {
+    snapshot();
+    setStamp((prev) => prev.filter((_, idx) => idx !== i));
+    setSelectedStroke(null);
+  };
+
+  const onHandleDown = (e, index, part) => {
+    e.preventDefault(); e.stopPropagation();
+    setSelectedStroke(index);
+    snapshot();
+    const startStroke = stamp[index];
+    const anchor = startStroke.points[0];
+    const startPt = screenToImage(e.clientX, e.clientY);
+    if (part === "move") {
+      beginWindowDrag((ev) => {
+        const cur = screenToImage(ev.clientX, ev.clientY);
+        const ddx = cur.x - startPt.x, ddy = cur.y - startPt.y;
+        updateStroke(index, { points: startStroke.points.map((p) => ({ x: p.x + ddx, y: p.y + ddy })) });
+      });
+    } else if (part === "src") {
+      beginWindowDrag((ev) => {
+        const cur = screenToImage(ev.clientX, ev.clientY);
+        updateStroke(index, { dx: startStroke.dx + (cur.x - startPt.x), dy: startStroke.dy + (cur.y - startPt.y) });
+      });
+    } else if (part === "resize") {
+      beginWindowDrag((ev) => {
+        const cur = screenToImage(ev.clientX, ev.clientY);
+        const radius = Math.max(STAMP_MIN_RADIUS, Math.hypot(cur.x - anchor.x, cur.y - anchor.y));
+        updateStroke(index, { radius });
+      });
+    }
+  };
+
+  /* A single, deliberate drag along a diagonal line can arrive as several
+     separate pointerdown/pointerup pairs instead of one continuous
+     press-move-release (observed with trackpad click-drag, where a brief
+     pressure dip mid-swipe reads to the OS as a release+re-press) — without
+     this, one intended brush stroke fractures into several disconnected
+     strokes, each getting its own (wrong, default-offset) source. If a new
+     pointerdown lands soon after and close to where the previous stroke's
+     last dab was, continue that stroke instead of starting a new one. */
+  const lastStrokeEndRef = useRef(null); // { index, point: {x,y}, at: timestamp }
+  const STROKE_CONTINUE_MS = 400;
+  const STROKE_CONTINUE_DIST_MULT = 3; // × brushRadius
+
+  const onOverlayDown = (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    if (spaceRef.current) return; // hand tool: let it bubble to .stage's own pan-drag
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    // clicking an existing stroke's path selects + drags it, rather than
+    // starting a new stroke on top of it
+    const p0 = screenToImage(e.clientX, e.clientY);
+    const hitIndex = stamp.findIndex((s) => nearestPointDist(s, p0.x, p0.y) <= s.radius);
+    if (hitIndex !== -1) {
+      onHandleDown(e, hitIndex, "move");
+      return;
+    }
+
+    const cont = lastStrokeEndRef.current;
+    const canContinue =
+      cont &&
+      cont.index < stamp.length &&
+      performance.now() - cont.at < STROKE_CONTINUE_MS &&
+      Math.hypot(p0.x - cont.point.x, p0.y - cont.point.y) < brushRadius * STROKE_CONTINUE_DIST_MULT;
+
+    // every OTHER stroke's dabs count as obstacles too, not just this
+    // stroke's own — two strokes stamped near each other (two wires a
+    // few pixels apart) can sample from one another just as easily as a
+    // single curved stroke can sample from itself.
+    const otherStrokesObstacles = (excludeIndex) =>
+      stamp.flatMap((s, i) => (i === excludeIndex ? [] : s.points.map((p) => ({ x: p.x, y: p.y, radius: s.radius }))));
+
+    // strokeMeta (dx/dy/radius), obstacles (a plain mutable list of every
+    // existing dab, own-stroke and other-strokes alike, updated in
+    // lockstep with `last` below rather than read back from React state),
+    // and preferred (this stroke's current effective {angle, distMult}, so
+    // it can ease smoothly rather than jump per dab — see pickDabOffset)
+    // are local for the whole gesture regardless of when it commits.
+    // `newPoints` accumulates ONLY this gesture's own new dabs — never
+    // written to `stamp` until pointerup (see beginWindowDrag's onUp
+    // below); `setDraft` drives the destination-only outline preview in
+    // the meantime, so no cloned pixels appear and no source ring/handles
+    // show until the stroke is actually finished.
+    let index, isNew, last, strokeMeta, obstacles, preferred, newPoints, strokeFeather;
+    if (canContinue) {
+      index = cont.index;
+      isNew = false;
+      last = cont.point;
+      const existing = stamp[index];
+      strokeMeta = { dx: existing.dx, dy: existing.dy, radius: existing.radius };
+      preferred = { angle: Math.atan2(strokeMeta.dy, strokeMeta.dx), distMult: 1 };
+      obstacles = [
+        ...otherStrokesObstacles(index),
+        ...existing.points.map((p) => ({ x: p.x, y: p.y, radius: strokeMeta.radius })),
+      ];
+      newPoints = [];
+      setSelectedStroke(index);
+      const [cx, cy] = clampToImage(p0.x, p0.y);
+      if (Math.hypot(cx - last.x, cy - last.y) >= brushRadius * STAMP_DAB_SPACING) {
+        const np = { x: cx, y: cy };
+        const result = pickDabOffset(strokeMeta, obstacles, np, preferred, editPixelsRef.current, iw, ih);
+        preferred = result;
+        const isNominal = Math.hypot(result.dx - strokeMeta.dx, result.dy - strokeMeta.dy) < 0.01;
+        const finalPoint = isNominal ? np : { ...np, dx: result.dx, dy: result.dy };
+        last = { x: cx, y: cy };
+        obstacles.push({ x: finalPoint.x, y: finalPoint.y, radius: strokeMeta.radius });
+        newPoints = [finalPoint];
+      }
+      setDraft({ index, isNew: false, points: newPoints, radius: strokeMeta.radius, dx: strokeMeta.dx, dy: strokeMeta.dy });
+    } else {
+      setSelectedStroke(null);
+      if (totalDabs >= MAX_STAMP_DABS) {
+        if (toast) toast(`Clone stamp is limited to ${MAX_STAMP_DABS} dabs per photo`);
+        return;
+      }
+      const [sx, sy] = clampToImage(p0.x, p0.y);
+      index = stamp.length;
+      isNew = true;
+      const initialObstacles = otherStrokesObstacles(index);
+      // direction picked contextually (see pickInitialOffset) instead of
+      // always defaulting to due horizontal — that default only happens to
+      // work when the thing being traced runs roughly vertically.
+      const initOffset = pickInitialOffset(editPixelsRef.current, { x: sx, y: sy }, brushRadius * STAMP_SOURCE_OFFSET_MULT, initialObstacles, brushRadius, iw, ih);
+      strokeMeta = { dx: initOffset.dx, dy: initOffset.dy, radius: brushRadius };
+      preferred = { angle: Math.atan2(strokeMeta.dy, strokeMeta.dx), distMult: 1 };
+      const firstPoint = { x: sx, y: sy };
+      obstacles = [...initialObstacles, { x: sx, y: sy, radius: brushRadius }];
+      // auto-feather: decided once, from what's actually around the first
+      // dab, instead of the flat session default — see autoFeather's own
+      // comment. Falls back to the session slider value if the proxy
+      // buffer hasn't finished decoding yet.
+      strokeFeather = autoFeather(editPixelsRef.current, firstPoint, brushRadius, feather);
+      newPoints = [firstPoint];
+      last = firstPoint;
+      setDraft({ index, isNew: true, points: newPoints, radius: brushRadius, dx: strokeMeta.dx, dy: strokeMeta.dy, feather: strokeFeather, opacity });
+    }
+
+    beginWindowDrag((ev) => {
+      const cur = screenToImage(ev.clientX, ev.clientY);
+      const [cx, cy] = clampToImage(cur.x, cur.y);
+      const spacing = brushRadius * STAMP_DAB_SPACING;
+      const dist = Math.hypot(cx - last.x, cy - last.y);
+      // a fast drag can jump much further than one dab-spacing between two
+      // consecutive pointermove events (the browser simply samples less
+      // often than the mouse moves) — placing only one dab at the new
+      // position, as this used to do, left a gap the eye reads as separate
+      // circles instead of one continuous stroke. Resampling the straight
+      // segment from the last dab to here at fixed spacing fills that gap
+      // regardless of how far a single tick's jump was.
+      const steps = Math.floor(dist / spacing);
+      if (steps < 1) return;
+      const interpolated = [];
+      for (let i = 1; i <= steps; i++) {
+        const t = (i * spacing) / dist;
+        const np = { x: last.x + (cx - last.x) * t, y: last.y + (cy - last.y) * t };
+        const result = pickDabOffset(strokeMeta, obstacles, np, preferred, editPixelsRef.current, iw, ih);
+        preferred = result;
+        const isNominal = Math.hypot(result.dx - strokeMeta.dx, result.dy - strokeMeta.dy) < 0.01;
+        const finalPoint = isNominal ? np : { ...np, dx: result.dx, dy: result.dy };
+        interpolated.push(finalPoint);
+        obstacles.push({ x: finalPoint.x, y: finalPoint.y, radius: strokeMeta.radius });
+      }
+      last = { x: interpolated[interpolated.length - 1].x, y: interpolated[interpolated.length - 1].y };
+      newPoints = [...newPoints, ...interpolated];
+      setDraft((d) => (d ? { ...d, points: newPoints } : d));
+    }, () => {
+      lastStrokeEndRef.current = { index, point: last, at: performance.now() };
+      if (newPoints.length === 0) { setDraft(null); return; }
+      if (isNew) {
+        snapshot();
+        const dabCount = stamp.reduce((n, s) => n + s.points.length, 0);
+        const room = MAX_STAMP_DABS - dabCount;
+        const toAdd = newPoints.slice(0, Math.max(0, room));
+        if (toAdd.length === 0) { setDraft(null); return; }
+        setStamp((prev) => [...prev, { points: toAdd, radius: strokeMeta.radius, dx: strokeMeta.dx, dy: strokeMeta.dy, feather: strokeFeather, opacity }]);
+      } else {
+        setStamp((prev) => {
+          const dabCount = prev.reduce((n, s) => n + s.points.length, 0);
+          const room = MAX_STAMP_DABS - dabCount;
+          if (room <= 0) return prev;
+          const toAdd = newPoints.slice(0, room);
+          return prev.map((s, i) => (i === index ? { ...s, points: [...s.points, ...toAdd] } : s));
+        });
+      }
+      setSelectedStroke(index);
+      setDraft(null);
+    });
+  };
+
+  const onOverlayDoubleClick = (e) => {
+    if (spaceRef.current) return; // hand tool: let it bubble to .stage's own zoom-to-fit
+    e.preventDefault(); e.stopPropagation();
+    const p0 = screenToImage(e.clientX, e.clientY);
+    const hitIndex = stamp.findIndex((s) => nearestPointDist(s, p0.x, p0.y) <= s.radius);
+    if (hitIndex !== -1) removeStroke(hitIndex);
+  };
+
+  /* Hollow outline of a stroke's silhouette, drawn as the boundary of the
+     UNION of a filled circle at every dab — one continuous "capsule" shape,
+     not a separate circle at each end plus a ribbon between them (a real
+     brush stroke's ends are just its first/last dab, already circles).
+     Built via a <mask> the same way the very first version of this overlay
+     was, but with one crucial difference: the mask's shapes are plain
+     filled CIRCLES per dab, never a stroked centerline. Overlapping filled
+     circles always union into one clean blob with no interior seam, no
+     matter how a path loops back over itself (scrubbing the brush, or
+     re-entering near its own start) — that's what a self-crossing STROKED
+     line failed at (it produced broken/garbled artifacts, since a stroke's
+     own outline is a more complex shape that a self-intersecting centerline
+     can render inconsistently). A disk union has no such failure mode, and
+     it automatically gives just the one true OUTER boundary even when the
+     path loops back on itself — no inner-loop seams to filter out. */
+  const strokeRing = (idPrefix, stroke, dx, dy, rPx, ringW, color) => {
+    const centers = resampleForOutline(stroke.points, stroke.radius).map((p) => imageToLocal(p.x + dx, p.y + dy));
+    // the hole punched out of the middle must NEVER reach (let alone clamp
+    // to) 0 — that would leave the outer circle fully unmasked, rendering
+    // as a SOLID filled disc instead of a ring (this is exactly what made
+    // the outline turn into a growing black blob while zooming out: rPx
+    // shrinks, a fixed-px ring width doesn't shrink with it, and once it
+    // caught up to rPx the hole vanished). Keeping both holes a proportion
+    // of rPx instead of a fixed px amount guarantees a hole always exists.
+    const inner = Math.max(rPx * 0.35, rPx - ringW);
+    const haloOuter = rPx + Math.max(0.5, rPx * 0.08);
+    const haloInner = Math.max(rPx * 0.15, rPx - ringW - 2);
+    const haloId = `${idPrefix}-halo`, ringId = `${idPrefix}-ring`;
+    return (
+      <g>
+        <mask id={haloId}>
+          {centers.map((c, k) => <circle key={`ho${k}`} cx={c.left} cy={c.top} r={haloOuter} fill="#fff" />)}
+          {haloInner > 0 && centers.map((c, k) => <circle key={`hi${k}`} cx={c.left} cy={c.top} r={haloInner} fill="#000" />)}
+        </mask>
+        <g mask={`url(#${haloId})`}>
+          {centers.map((c, k) => <circle key={`hc${k}`} cx={c.left} cy={c.top} r={haloOuter} fill="rgba(0,0,0,.6)" />)}
+        </g>
+        <mask id={ringId}>
+          {centers.map((c, k) => <circle key={`ro${k}`} cx={c.left} cy={c.top} r={rPx} fill="#fff" />)}
+          {inner > 0 && centers.map((c, k) => <circle key={`ri${k}`} cx={c.left} cy={c.top} r={inner} fill="#000" />)}
+        </mask>
+        <g mask={`url(#${ringId})`}>
+          {centers.map((c, k) => <circle key={`rc${k}`} cx={c.left} cy={c.top} r={rPx} fill={color} />)}
+        </g>
+      </g>
+    );
+  };
+
+  const cursorPx = brushRadius * view.k * 2;
+  return (
+    <div
+      ref={overlayRef}
+      className="stamp-overlay"
+      onPointerDown={onOverlayDown}
+      onPointerMove={onOverlayMove}
+      onPointerEnter={showCursor}
+      onPointerLeave={hideCursor}
+      onDoubleClick={onOverlayDoubleClick}
+    >
+      <div
+        ref={cursorRef}
+        className="stamp-cursor"
+        style={{ width: cursorPx, height: cursorPx, opacity: 0 }}
+      />
+      <svg className="stamp-svg">
+        {stamp.map((stroke, i) => {
+          // a stroke actively being EXTENDED (continuation drag in
+          // progress — see `draft`) shows just its destination outline,
+          // same as everything else while the mouse is held; the source
+          // ring/line/handles reappear once that drag commits.
+          const draftActiveHere = draft && !draft.isNew && draft.index === i;
+          const isSel = i === selectedStroke && !draftActiveHere;
+          const rPx = stroke.radius * view.k;
+          // ring/halo thickness scale down for a small brush radius, capped
+          // for a large one — a fixed pixel width made a thin brush (e.g.
+          // tracing a pole/wire) look almost solid rather than hollow.
+          const ringW = Math.max(1.5, Math.min(3, rPx * 0.15));
+          // a plain white outline all but vanishes against a bright sky —
+          // a light cyan reads clearly against both light and dark content
+          const dstColor = isSel ? "#f3c34f" : "rgba(130,215,255,.95)";
+          const anchorLocal = imageToLocal(stroke.points[0].x, stroke.points[0].y);
+          const srcAnchorLocal = isSel ? imageToLocal(stroke.points[0].x + stroke.dx, stroke.points[0].y + stroke.dy) : null;
+          return (
+            <g key={i}>
+              {strokeRing(`stamp-dst-${i}`, stroke, 0, 0, rPx, ringW, dstColor)}
+              {isSel && (
+                <>
+                  {strokeRing(`stamp-src-${i}`, stroke, stroke.dx, stroke.dy, rPx, ringW, "#f3c34f")}
+                  <line
+                    x1={anchorLocal.left} y1={anchorLocal.top}
+                    x2={srcAnchorLocal.left} y2={srcAnchorLocal.top}
+                    stroke="rgba(243,195,79,.85)" strokeWidth={1.5}
+                  />
+                </>
+              )}
+            </g>
+          );
+        })}
+        {draft && draft.points.length > 0 && (() => {
+          const rPx = draft.radius * view.k;
+          const ringW = Math.max(1.5, Math.min(3, rPx * 0.15));
+          return <g key="stamp-draft">{strokeRing("stamp-draft", draft, 0, 0, rPx, ringW, "rgba(130,215,255,.95)")}</g>;
+        })()}
+      </svg>
+      {stamp.map((stroke, i) => {
+        if (i !== selectedStroke || (draft && draft.index === i)) return null;
+        const rPx = stroke.radius * view.k;
+        const anchor = stroke.points[0];
+        const anchorLocal = imageToLocal(anchor.x, anchor.y);
+        const src = imageToLocal(anchor.x + stroke.dx, anchor.y + stroke.dy);
+        // grabbable regardless of how small the brush's own visual circle
+        // is on screen — the hit target is only ever the SAME size as or
+        // BIGGER than the visual ring, never smaller, so it stays honest
+        // about what it does without needing its own separate outline.
+        const hitR = Math.max(rPx, STAMP_SRC_HIT_MIN);
+        return (
+          <div key={i}>
+            <div
+              className="stamp-hit src"
+              style={{ left: src.left - hitR, top: src.top - hitR, width: hitR * 2, height: hitR * 2 }}
+              onPointerDown={(e) => onHandleDown(e, i, "src")}
+            />
+            <div
+              className="stamp-handle"
+              style={{ left: anchorLocal.left + rPx * Math.SQRT1_2 - 5, top: anchorLocal.top - rPx * Math.SQRT1_2 - 5 }}
+              onPointerDown={(e) => onHandleDown(e, i, "resize")}
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExportSelected, onRate, selected, onToggleSel, onRangeSel, onContextExport, suppressKeys, theme, onToggleTheme, toast, busyExport, filmstripHeight, onFilmstripResize }) {
   const stageRef = useRef(null);
   const [stage, setStage] = useState({ w: 0, h: 0 });
   const [rect, setRect] = useState(null);
   const [view, setView] = useState(null); // { icx, icy, k, theta }
-  const [interacting, setInteracting] = useState(false);
   const [anim, setAnim] = useState(false);
   const [aspect, setAspect] = useState("free");
   const [flipped, setFlipped] = useState(false);
   const [leveling, setLeveling] = useState(false);
   const [levelOpts, setLevelOpts] = useState(null);
-  const [mode, setMode] = useState("view"); // 'view' = clean cropped photo, 'crop' = editing UI
+  const [mode, setMode] = useState("view"); // 'view' = clean cropped photo, 'crop' = editing UI, 'stamp' = clone stamp
+  const [adjust, setAdjust] = useState(() => ({ ...defaultAdjust(), ...(photo.edits?.adjust || {}) }));
+  const [stamp, setStamp] = useState(() => normalizeStamp(photo.edits?.stamp ?? photo.edits?.heal));
+  const [selectedStroke, setSelectedStroke] = useState(null); // index into stamp, local-only (not persisted)
+  // The clone-stamp stroke currently being drawn/extended, while a drag is
+  // still down — lifted up here (not local to StampOverlay) so GLImage can
+  // fold it into its live composite too; see GLImage's uploadTexture and
+  // StampOverlay's own comment above its pointer handlers. Never part of
+  // undo/redo history or `currentEdits()` — only a finished, committed
+  // stroke in `stamp` itself is either of those things.
+  const [draft, setDraft] = useState(null);
   const [gesturing, setGesturing] = useState(false); // GPU-compositing hint during zoom/pan
   const [tile, setTile] = useState(null);            // deep-zoom sharpness overlay
   const [exif, setExif] = useState(null);
@@ -1149,10 +2597,10 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
   /* --- crop history (Ctrl+Z / Ctrl+Shift+Z) --- */
   const snapshot = useCallback(() => {
     if (!rect || !view) return;
-    hist.current.undo.push({ rect: { ...rect }, view: { ...view }, aspect, flipped });
+    hist.current.undo.push({ rect: { ...rect }, view: { ...view }, aspect, flipped, adjust: { ...adjust }, stamp: [...stamp] });
     if (hist.current.undo.length > 50) hist.current.undo.shift();
     hist.current.redo = [];
-  }, [rect, view, aspect, flipped]);
+  }, [rect, view, aspect, flipped, adjust, stamp]);
 
   const restoreSnap = useCallback((s) => {
     cancelFlip();
@@ -1161,25 +2609,74 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     setView(s.view);
     setAspect(s.aspect);
     setFlipped(s.flipped);
+    if (s.adjust) setAdjust(s.adjust);
+    if (s.stamp) setStamp(s.stamp);
+    setSelectedStroke(null);
   }, [cancelFlip]);
 
   const undo = useCallback(() => {
     const s = hist.current.undo.pop();
     if (!s || !rect || !view) return;
-    hist.current.redo.push({ rect: { ...rect }, view: { ...view }, aspect, flipped });
+    hist.current.redo.push({ rect: { ...rect }, view: { ...view }, aspect, flipped, adjust: { ...adjust }, stamp: [...stamp] });
     restoreSnap(s);
-  }, [rect, view, aspect, flipped, restoreSnap]);
+  }, [rect, view, aspect, flipped, adjust, stamp, restoreSnap]);
 
   const redo = useCallback(() => {
     const s = hist.current.redo.pop();
     if (!s || !rect || !view) return;
-    hist.current.undo.push({ rect: { ...rect }, view: { ...view }, aspect, flipped });
+    hist.current.undo.push({ rect: { ...rect }, view: { ...view }, aspect, flipped, adjust: { ...adjust }, stamp: [...stamp] });
     restoreSnap(s);
-  }, [rect, view, aspect, flipped, restoreSnap]);
+  }, [rect, view, aspect, flipped, adjust, stamp, restoreSnap]);
   const zoomBase = useRef(1);
   const drag = useRef(null);
   const refitTimer = useRef(null);
   const iw = photo.w, ih = photo.h;
+
+  // clone stamp brush settings — session-local (not persisted; each
+  // already-painted stroke keeps its own radius/feather/opacity regardless
+  // of later slider changes, same as real brush tools). feather is the
+  // falloff-zone width as a fraction of radius (0 = hard edge, more = softer);
+  // opacity caps how fully the clone replaces the original at full strength
+  // (less than 1 blends toward the original — softening rather than erasing).
+  const [brushRadius, setBrushRadius] = useState(() => Math.round(Math.min(iw, ih) * 0.03));
+  const [feather, setFeather] = useState(0.3);
+  const [stampOpacity, setStampOpacity] = useState(1);
+
+  /* Read-only proxy-resolution pixel buffer for StampOverlay's own use —
+     picking a source offset that avoids a stroke overlapping its own
+     already-painted area, and auto-sizing a new stroke's feather to the
+     local texture (see StampOverlay's pickDabOffset/autoFeather). Decoded
+     once per photo, from the PRISTINE proxy — deliberately not the live,
+     progressively-stamped buffer GLImage recomposites: this only needs to
+     be "roughly what's around here", the same way a person eyeballing the
+     photo would decide where to drag the source handle, not a precise
+     up-to-the-last-dab preview (that stays GLImage's job for the actual
+     pixels that get blended). */
+  const editPixelsRef = useRef(null); // { data, width, height, scale } — scale = buffer px per original-image px
+  useEffect(() => {
+    let alive = true;
+    editPixelsRef.current = null;
+    loadImage(proxyURL(photo)).then((img) => {
+      if (!alive) return;
+      const c = document.createElement("canvas");
+      c.width = img.naturalWidth; c.height = img.naturalHeight;
+      const ctx = c.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      editPixelsRef.current = {
+        data: ctx.getImageData(0, 0, c.width, c.height).data,
+        width: c.width, height: c.height,
+        scale: c.width / iw,
+      };
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, [photo.id, photo.path, iw]);
+
+  // stable object identities (GLImage's redraw effect depends on texRegion)
+  const baseTexRegion = useMemo(() => ({ sx: 0, sy: 0, sw: iw }), [iw]);
+  const tileTexRegion = useMemo(
+    () => (tile ? { sx: tile.sx, sy: tile.sy, sw: tile.sw } : undefined),
+    [tile],
+  );
 
   useLayoutEffect(() => {
     const el = stageRef.current;
@@ -1213,9 +2710,25 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     setView({ icx, icy, k, theta });
   }, [stage, rect, photo, iw, ih]);
 
-  const coverageOK = useCallback((r, v) => {
+  // margin defaults to a small POSITIVE tolerance (checks pass a hair
+  // outside the true edge) — right for one-shot checks like a resize
+  // candidate or a wheel-zoom step, which are used immediately and never
+  // rescaled afterward. maximizedRect (below) passes a small NEGATIVE
+  // margin instead: its search result is always fed straight into refit(),
+  // which can rescale by an arbitrary factor (>1 as often as <1 — a narrow
+  // aspect on a wide stage genuinely needs to zoom IN to fill it), and that
+  // rescale multiplies whatever margin the search settled for by the same
+  // factor. A result found riding the positive-tolerance edge can land
+  // outside true bounds after a >1x rescale (confirmed empirically —
+  // scratchpad/verify_aspect_switch_freeze.mjs — up to ~0.9px over on
+  // ordinary photo/window sizes), which then fails EVERY resize-handle
+  // candidate's own coverageOK(r0) check, including the no-op one, so
+  // dragging looked completely dead after switching aspect ratios. A
+  // strictly-negative margin guarantees genuine geometric slack that
+  // stays positive under any positive rescale factor, however large.
+  const coverageOK = useCallback((r, v, margin = 0.5) => {
     const t = rad(v.theta);
-    const hw = (iw * v.k) / 2 + 0.5, hh = (ih * v.k) / 2 + 0.5;
+    const hw = (iw * v.k) / 2 + margin, hh = (ih * v.k) / 2 + margin;
     const corners = [
       [r.x, r.y], [r.x + r.w, r.y], [r.x, r.y + r.h], [r.x + r.w, r.y + r.h],
     ];
@@ -1306,6 +2819,36 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     }
   }, [stage, fadeOutTile, cancelFlip]);
 
+  /* Double-clicking empty space around the crop selection (crop mode) zooms
+     out to show the whole original photo WITHOUT touching the crop
+     selection itself. refit() above is built to make whatever rect it's
+     given become the new crop (exactly right for "fit the current crop
+     selection to the screen") — feeding it a whole-photo rect instead
+     overwrites the actual crop selection with the whole photo's bounds,
+     which is indistinguishable from the crop having been reset. This
+     instead reads the crop's own image-space coordinates first, computes a
+     view that fits the whole photo, then re-projects that SAME crop
+     through the new view so it lands in the right place — now surrounded
+     by more visible photo instead of filling the screen. */
+  const zoomToWholePhoto = useCallback(() => {
+    if (!rect || !view || !stage.w || !stage.h) return;
+    cancelFlip();
+    const t = rad(view.theta);
+    const c = { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 };
+    const [qx, qy] = irot(c.x - view.icx, c.y - view.icy, t);
+    const qcx = qx / view.k, qcy = qy / view.k;
+    const cw = rect.w / view.k, ch = rect.h / view.k;
+    const availW = stage.w - 2 * PAD, availH = stage.h - 2 * PAD;
+    if (availW <= 0 || availH <= 0) return;
+    const k = Math.min(availW / iw, availH / ih);
+    const nv = { icx: stage.w / 2, icy: stage.h / 2, k, theta: view.theta };
+    const [ox, oy] = rot(qcx * k, qcy * k, t);
+    const nr = { x: nv.icx + ox - (cw * k) / 2, y: nv.icy + oy - (ch * k) / 2, w: cw * k, h: ch * k };
+    zoomBase.current = k;
+    setRect(nr);
+    setView(nv);
+  }, [rect, view, stage, iw, ih, cancelFlip]);
+
   useLayoutEffect(() => {
     if (!flipReq) return;
     const el = worldRef.current;
@@ -1327,7 +2870,33 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     }));
   }, [flipReq]);
 
+  /* Switching mode toggles the bottom toolbelt (crop/stamp controls), which
+     changes .stage's own available height/width as a side effect — that
+     resize would otherwise trip the auto-refit below and rescale whatever
+     zoom the user was deliberately at, purely because a panel appeared.
+     This flag, set synchronously right as the mode-driven layout change
+     commits, tells the very next stage-resize to skip the refit once.
+
+     EXCEPT entering crop mode. Crop renders the FULL original photo (not
+     just the current rect) through the same view transform that was tuned
+     to fit the smaller, toolbelt-less view-mode stage — without refitting
+     here, the photo hangs off the bottom behind the crop toolbelt that
+     just appeared, and stays that way (nothing else re-triggers a refit)
+     until an unrelated later resize happens to fire one, e.g. releasing a
+     dragged crop handle 180ms after pointerup. So don't arm the
+     suppression for that specific transition: let the resize-triggered
+     refit below run immediately and correct it before the crop tools are
+     even usable. */
+  const suppressRefitRef = useRef(false);
+  useLayoutEffect(() => {
+    suppressRefitRef.current = mode !== "crop";
+  }, [mode]);
+
   useEffect(() => {
+    if (suppressRefitRef.current) {
+      suppressRefitRef.current = false;
+      return;
+    }
     if (rect && view && stage.w && stage.h) {
       const availW = stage.w - 2 * PAD, availH = stage.h - 2 * PAD;
       if (rect.w > availW || rect.h > availH || (rect.w < availW - 1 && rect.h < availH - 1)) {
@@ -1349,20 +2918,29 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     };
     if (mode !== "pan") snapshot();
     clearTimeout(refitTimer.current);
-    setInteracting(true);
     setGesturing(true);
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp, { once: true });
   };
 
+  /* "Original" aspect means "this photo's own aspect ratio, as currently
+     oriented" — after a quarter-turn (rotate90, portrait<->landscape), that's
+     ih/iw, not iw/ih. A small fine-leveling angle doesn't flip it (only a
+     90/270 turn does), same distinction coverageOK already draws elsewhere
+     between "rotate the frame" and "level a few degrees". */
+  const origAspect = useCallback(
+    (theta) => (((Math.round(theta / 90) % 2) + 2) % 2 === 1 ? ih / iw : iw / ih),
+    [iw, ih],
+  );
+
   const aspectValue = useMemo(() => {
     const a = ASPECTS.find((x) => x.key === aspect);
     let v = null;
-    if (a?.key === "orig") v = iw / ih;
+    if (a?.key === "orig") v = origAspect(view?.theta || 0);
     else if (a?.v) v = a.v;
     if (v && flipped && aspect !== "1:1") v = 1 / v;
     return v;
-  }, [aspect, flipped, iw, ih]);
+  }, [aspect, flipped, view, origAspect]);
 
   const onMove = useCallback((e) => {
     const d = drag.current;
@@ -1426,9 +3004,19 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       cand.x = a ? cx0 - w1 / 2 : r0.x;
     }
 
-    const inStage = (r) =>
-      r.x >= 6 && r.y >= 6 && r.x + r.w <= stage.w - 6 && r.y + r.h <= stage.h - 6;
-    const valid = (r) => inStage(r) && coverageOK(r, d.view);
+    // Only the photo's own actual bounds (coverageOK) are a real constraint
+    // on a resize candidate — requiring the WHOLE rect to also stay within
+    // the visible .stage viewport (an earlier `inStage` check) is wrong
+    // once the user is zoomed in past "fit": the committed rect can then
+    // already extend beyond the stage on its own (wheel-zoom scales rect
+    // freely, with no stage-size ceiling), so `inStage` was false even for
+    // the UNCHANGED starting rect — every resize candidate the binary
+    // search below tried was rejected, including ones a hair's breadth
+    // from the start, so it always converged back to ~no visible change at
+    // all. Dropping it lets resize work at any zoom; panning/the
+    // release-triggered re-fit-to-100% (see the wheel handler's own
+    // comment) is what brings an off-screen edge back into view.
+    const valid = (r) => coverageOK(r, d.view);
     const lerp = (t) => ({
       x: r0.x + (cand.x - r0.x) * t,
       y: r0.y + (cand.y - r0.y) * t,
@@ -1445,17 +3033,22 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       applied = lerp(lo);
     }
     setRect(applied);
-  }, [aspectValue, clampCenter, coverageOK, stage]);
+  }, [aspectValue, clampCenter, coverageOK]);
 
   const onUp = useCallback(() => {
     window.removeEventListener("pointermove", onMove);
     const wasResize = drag.current && drag.current.mode !== "image" && drag.current.mode !== "pan";
     drag.current = null;
-    setInteracting(false);
     setGesturing(false);
     if (wasResize) {
       refitTimer.current = setTimeout(() => {
-        setRect((r) => { setView((v) => { r && v && refit(r, v, true); return v; }); return r; });
+        // animate=false — see the rotate90/pickAspect/toggleFlip refit calls
+        // for why: a quick second resize-drag started before this delayed
+        // refit's own animation finishes calls cancelFlip() and freezes
+        // .world's transform mid-transition, visually detaching the crop
+        // frame (and its handles) from where React actually has it — which
+        // reads as "dragging the handles stopped working".
+        setRect((r) => { setView((v) => { r && v && refit(r, v, false); return v; }); return r; });
       }, 180);
     }
   }, [onMove, refit]);
@@ -1469,11 +3062,13 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       const rh = v >= 1 ? sz / v : sz;
       return { x: c.x - rw / 2, y: c.y - rh / 2, w: rw, h: rh };
     };
+    // -1: search strictly inside the true image edge (see coverageOK's own
+    // comment above for why this can't just reuse its default +0.5 margin).
     let lo = MIN_CROP, hi = (iw + ih) * vw.k;
-    if (!coverageOK(rectOf(lo), vw)) return rectOf(lo);
+    if (!coverageOK(rectOf(lo), vw, -1)) return rectOf(lo);
     for (let i = 0; i < 28; i++) {
       const mid = (lo + hi) / 2;
-      if (coverageOK(rectOf(mid), vw)) lo = mid; else hi = mid;
+      if (coverageOK(rectOf(mid), vw, -1)) lo = mid; else hi = mid;
     }
     return rectOf(lo);
   }, [iw, ih, coverageOK]);
@@ -1498,7 +3093,13 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     [icx, icy] = clampCenter(icx, icy, nr, k, deg);
     setRect(nr);
     setView({ icx, icy, k, theta: deg });
-    setTimeout(() => setView((vv) => { refit(nr, vv, true); return vv; }), 20);
+    // animate=false: an animated refit here can be interrupted mid-flight by
+    // cancelFlip() from another quick action (rotate/aspect/resize again
+    // before this one's ~260-460ms CSS transition finishes), which freezes
+    // .world's transform on a half-finished frame instead of the correct
+    // final one — same hazard as the crop-area double-click bug, fixed the
+    // same way (see .cropframe's onDoubleClick comment for the full story).
+    setTimeout(() => setView((vv) => { refit(nr, vv, false); return vv; }), 20);
   }, [rect, view, snapshot, minK, clampCenter, refit, cancelFlip]);
 
   /* --- aspect selection: expand to the largest crop the whole image
@@ -1511,12 +3112,18 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     if (noFlip && flipped) setFlipped(false);
     if (!rect || !view) return;
     const def = ASPECTS.find((x) => x.key === key);
-    let v = def?.key === "orig" ? iw / ih : def?.v || null;
+    let v = def?.key === "orig" ? origAspect(view.theta) : def?.v || null;
     if (v && flipped && !noFlip) v = 1 / v;
     if (!v) return;
     const nr = maximizedRect(v, view);
     setRect(nr);
-    setTimeout(() => setView((vv) => { refit(nr, vv, true); return vv; }), 20);
+    // animate=false: an animated refit here can be interrupted mid-flight by
+    // cancelFlip() from another quick action (rotate/aspect/resize again
+    // before this one's ~260-460ms CSS transition finishes), which freezes
+    // .world's transform on a half-finished frame instead of the correct
+    // final one — same hazard as the crop-area double-click bug, fixed the
+    // same way (see .cropframe's onDoubleClick comment for the full story).
+    setTimeout(() => setView((vv) => { refit(nr, vv, false); return vv; }), 20);
   };
 
   const toggleFlip = () => {
@@ -1526,7 +3133,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     const nf = !flipped;
     setFlipped(nf);
     const def = ASPECTS.find((x) => x.key === aspect);
-    let v = def?.key === "orig" ? iw / ih : def?.v || null;
+    let v = def?.key === "orig" ? origAspect(view.theta) : def?.v || null;
     if (!v) {
       // free aspect: flip the current frame's own proportions
       v = rect.h / rect.w;
@@ -1535,7 +3142,13 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     }
     const nr = maximizedRect(v, view);
     setRect(nr);
-    setTimeout(() => setView((vv) => { refit(nr, vv, true); return vv; }), 20);
+    // animate=false: an animated refit here can be interrupted mid-flight by
+    // cancelFlip() from another quick action (rotate/aspect/resize again
+    // before this one's ~260-460ms CSS transition finishes), which freezes
+    // .world's transform on a half-finished frame instead of the correct
+    // final one — same hazard as the crop-area double-click bug, fixed the
+    // same way (see .cropframe's onDoubleClick comment for the full story).
+    setTimeout(() => setView((vv) => { refit(nr, vv, false); return vv; }), 20);
   };
 
   /* --- mouse-wheel: zoom the whole canvas (frame + image together).
@@ -1550,7 +3163,12 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       e.preventDefault();
       const b = el.getBoundingClientRect();
       const m = { x: e.clientX - b.left, y: e.clientY - b.top };
-      const factor = Math.exp(-e.deltaY * 0.0024);
+      // trackpad pinch (and literal Ctrl+wheel) synthesize wheel events
+      // with ctrlKey:true regardless of whether Ctrl is actually held —
+      // that's the standard signal a pinch gesture drove this event rather
+      // than linear two-finger/mouse-wheel scrolling, so it gets its own,
+      // much stronger multiplier instead of sharing the scroll one.
+      const factor = Math.exp(-e.deltaY * (e.ctrlKey ? 0.0096 : 0.0024));
       const availW = stage.w - 2 * PAD, availH = stage.h - 2 * PAD;
       const kFitImg = Math.min(availW / iw, availH / ih); // whole image visible
       const kLow = Math.min(view.k, kFitImg);
@@ -1586,6 +3204,9 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
      zoomed past the proxy's resolution, fetch a tile of the visible
      region from the full-resolution original --- */
   useEffect(() => {
+    // already editing the full original (see editSrcURL/isFullResEligible)
+    // — no lower-resolution proxy ceiling exists for a tile to patch in.
+    if (isFullResEligible(photo)) return;
     if (!NATIVE || !photo.path || !view || !rect || !stage.w) return;
     const kProxy = PROXY_LONG / Math.max(iw, ih);
     if (view.k <= kProxy * 1.08 || gesturing) {
@@ -1614,6 +3235,15 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       const data = await window.meridian.renderTile(photo.path, { sx, sy, sw, sh, dw });
       if (!data || token !== tileToken.current) return;
       const url = URL.createObjectURL(new Blob([data], { type: "image/jpeg" }));
+      // Pre-decode before swapping: setTile() below flips .tileimg's CSS
+      // position/size to the new tile's bounds immediately, but GLImage's
+      // own texture upload only starts once its `src` prop changes and
+      // loadImage() resolves — a visible frame or two of the OLD texture
+      // stretched into the NEW bounds otherwise (the "stutter" on rapid
+      // zoom). loadImage() is cache-backed, so warming it here means
+      // GLImage's own call resolves instantly once `tile` actually flips.
+      await loadImage(url);
+      if (token !== tileToken.current) { URL.revokeObjectURL(url); return; }
       if (tileUrl.current) URL.revokeObjectURL(tileUrl.current);
       tileUrl.current = url;
       setTile({ url, sx, sy, sw, sh });
@@ -1660,6 +3290,10 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     snapshot();
     cancelFlip();
     setAspect("free"); setFlipped(false); setLevelOpts(null);
+    setAdjust(defaultAdjust());
+    setStamp([]);
+    setSelectedStroke(null);
+    setDraft(null);
     const availW = stage.w - 2 * PAD, availH = stage.h - 2 * PAD;
     const k = Math.min(availW / iw, availH / ih);
     const rw = iw * k, rh = ih * k;
@@ -1668,6 +3302,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     setRect(r);
     setView({ icx: stage.w / 2, icy: stage.h / 2, k, theta: 0 });
     onApply(null, null); // reverting is applied immediately
+    cachePreviewToDisk(photo.path, null);
     toast("Restored to original");
   };
 
@@ -1686,8 +3321,30 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       Math.abs(e.theta) < 0.05 &&
       Math.abs(e.qcx) < 1 && Math.abs(e.qcy) < 1 &&
       e.cw > iw - 2 && e.ch > ih - 2;
-    return isFull ? null : e;
-  }, [rect, view, iw, ih]);
+    if (isFull && isDefaultAdjust(adjust) && stamp.length === 0) return null;
+    if (!isDefaultAdjust(adjust)) e.adjust = { ...adjust };
+    if (stamp.length > 0) e.stamp = stamp;
+    return e;
+  }, [rect, view, iw, ih, adjust, stamp]);
+
+  // Same crop/rotate math as currentEdits() above, kept as its own memo
+  // (deliberately NOT folding `adjust` in, unlike currentEdits) so the
+  // histogram's crop-region decode below only re-triggers on an actual
+  // crop/rotate/stamp change — not on every slider tick, which needs to
+  // stay cheap and synchronous (see Histogram's own draw()).
+  const histCrop = useMemo(() => {
+    if (!rect || !view) return null;
+    const c = { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 };
+    const [qx, qy] = irot(c.x - view.icx, c.y - view.icy, rad(view.theta));
+    return {
+      theta: view.theta,
+      qcx: qx / view.k,
+      qcy: qy / view.k,
+      cw: Math.min(iw, rect.w / view.k),
+      ch: Math.min(ih, rect.h / view.k),
+      stamp,
+    };
+  }, [rect, view, iw, ih, stamp]);
 
   const buildEdits = async () => {
     const e = currentEdits();
@@ -1695,16 +3352,49 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     if (e) {
       preview = await bakePreview(proxyURL(photo), iw, ih, e, 560);
     }
+    cachePreviewToDisk(photo.path, preview);
     return [e, preview];
   };
+
+  /* Unlike crop (an explicit mode with its own Done button), color sliders
+     and clone-stamp strokes are always-live with no discrete "commit"
+     moment — so auto-commit them into shared state shortly after the user
+     stops adjusting. Without this, any export trigger that isn't this
+     Editor's own Export/Done/Escape path (the library toolbar, a right-click
+     on the grid or on this photo's own filmstrip thumbnail while still
+     mid-edit) reads the shared `photos` array directly and would see stale,
+     pre-adjustment data. */
+  const autoCommitMounted = useRef(false);
+  const autoCommitTimer = useRef(null);
+  useEffect(() => {
+    if (!autoCommitMounted.current) { autoCommitMounted.current = true; return undefined; }
+    clearTimeout(autoCommitTimer.current);
+    autoCommitTimer.current = setTimeout(() => {
+      buildEdits().then(([e, preview]) => onApply(e, preview));
+    }, 500);
+    return () => clearTimeout(autoCommitTimer.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adjust, stamp]);
 
   /* Done / Enter: apply the crop, hide the crop UI, show the clean result */
   const apply = async () => {
     const [e, preview] = await buildEdits();
     onApply(e, preview);
     setLevelOpts(null);
-    if (rect && view) refit(rect, view, true); // normalize the fitted view
+    // Only re-fit after committing a CROP: the frame itself just changed, so
+    // normalizing the view to the new crop is expected. Applying from stamp
+    // mode (or from view mode, e.g. just color-adjusting) must leave zoom/pan
+    // exactly as-is — the user is often applying specifically to check the
+    // result of a stamp edit at the zoom they were just working at.
+    // animate=false: this was the actual source of a nasty bug — its ~260-
+    // 460ms flip animation was still mid-flight when the user quickly
+    // re-entered crop mode and picked an aspect, whose own cancelFlip() froze
+    // .world's transform on a half-finished frame, visually detaching
+    // .cropframe's handles from where they really were (see
+    // feedback_flip_animation_interruption.md for the full mechanism).
+    if (mode === "crop" && rect && view) refit(rect, view, false);
     setMode("view");
+    setDraft(null);
     if (!e) toast("Restored to original");
   };
 
@@ -1743,7 +3433,18 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     const onKey = (ev) => {
       if (suppressKeys) return;
       const tag = ev.target?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      // a slider keeps keyboard focus after a drag — Enter/Escape must still
+      // act as confirm/cancel then, so only text-entry fields block them
+      const inTextField = (tag === "INPUT" && ev.target.type !== "range") || tag === "TEXTAREA";
+      if (ev.key === "Enter" && !inTextField) { ev.preventDefault(); apply(); return; }
+      if (ev.key === "Escape" && !inTextField) { ev.preventDefault(); exit(); return; }
+      if (inTextField) return;
+      // a slider keeps focus after a drag (see inTextField above), so without
+      // this a stray Delete/[/]/etc. right after adjusting Brush size/Feather/
+      // Opacity would silently do nothing — only arrow keys still need to be
+      // left alone here, since those are the native way to nudge a focused
+      // range input and must not be hijacked for sibling-photo navigation.
+      if (tag === "INPUT" && (ev.key === "ArrowLeft" || ev.key === "ArrowRight")) return;
       if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "z") {
         ev.preventDefault();
         ev.shiftKey ? redo() : undo();
@@ -1757,16 +3458,34 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
         if (next) switchTo(next.id);
         return;
       }
-      if (ev.key === "Escape") { ev.preventDefault(); exit(); }
-      else if (ev.key === "Enter") {
+      if ((ev.key === "[" || ev.key === "]") && mode === "stamp") {
         ev.preventDefault();
-        if (mode === "crop") apply();
-        else setMode("crop");
+        const min = Math.max(2, Math.round(Math.min(iw, ih) * 0.0012));
+        const max = Math.round(Math.min(iw, ih) * 0.15);
+        setBrushRadius((r) => Math.round(Math.min(max, Math.max(min, r * (ev.key === "]" ? 1.15 : 1 / 1.15)))));
+      }
+      else if (["+", "=", "-", "_"].includes(ev.key) && mode === "stamp") {
+        ev.preventDefault();
+        const min = Math.max(2, Math.round(Math.min(iw, ih) * 0.0012));
+        const max = Math.round(Math.min(iw, ih) * 0.15);
+        const grow = ev.key === "+" || ev.key === "=";
+        setBrushRadius((r) => Math.round(Math.min(max, Math.max(min, r * (grow ? 1.15 : 1 / 1.15)))));
       }
       else if (ev.key === "[" || ev.key === "]") {
         if (mode !== "crop") return;
         ev.preventDefault();
         rotate90(ev.key === "]" ? 1 : -1);
+      }
+      else if (ev.key.toLowerCase() === "s" && !ev.ctrlKey && !ev.metaKey && !ev.altKey) {
+        if (mode !== "view") return;
+        ev.preventDefault();
+        setMode("stamp");
+      }
+      else if ((ev.key === "Delete" || ev.key === "Backspace") && mode === "stamp" && selectedStroke != null) {
+        ev.preventDefault();
+        snapshot();
+        setStamp((prev) => prev.filter((_, i) => i !== selectedStroke));
+        setSelectedStroke(null);
       }
       else if (/^[0-5]$/.test(ev.key)) {
         const n = parseInt(ev.key, 10);
@@ -1777,7 +3496,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onRate, photo.id, suppressKeys, toast, rect, view, mode, siblings, undo, redo]);
+  }, [onRate, photo.id, suppressKeys, toast, rect, view, mode, siblings, undo, redo, selectedStroke, snapshot]);
 
   const theta = view ? view.theta : 0;
   const rot90Steps = Math.round(theta / 90);
@@ -1803,16 +3522,36 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
         </button>
         <button className="btn ghost" onClick={reset}>Reset</button>
         {mode === "view" ? (
-          <button className="btn primary" onClick={() => setMode("crop")} title="Open crop tools (Enter)">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>
-            Crop
-          </button>
+          <>
+            <button className="btn ghost" onClick={() => setMode("stamp")} title="Clone stamp (S)">
+              {/* a rubber-stamp silhouette (ink-pad base + arched body + T
+                  handle) — distinct from a generic plus-in-circle, which
+                  reads as a "heal"/"add" icon rather than "clone stamp" in
+                  every other photo editor's own tool palette */}
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><rect x="4" y="17" width="16" height="4" rx="1"/><path d="M7 17v-2a5 5 0 0 1 10 0v2"/><path d="M12 10V5M9 5h6"/></svg>
+              Stamp
+            </button>
+            <button className="btn primary" onClick={() => setMode("crop")} title="Open crop tools">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>
+              Crop
+            </button>
+          </>
         ) : (
           <button className="btn primary" onClick={apply} title="Apply (Enter)">Done</button>
         )}
         <button
           className="btn"
-          onClick={() => (selected && selected.size > 0 ? onExportSelected() : onExport(currentEdits()))}
+          onClick={async () => {
+            // commit live edits (crop + adjust + stamp) first — otherwise a
+            // tweak made without hitting Done/Enter first gets left behind.
+            // onApply() queues an async setPhotos that isn't flushed yet, so
+            // the batch-selection branch can't just re-read shared state for
+            // THIS photo — hand it the fresh edits directly instead.
+            const [e, preview] = await buildEdits();
+            onApply(e, preview);
+            if (selected && selected.size > 0) onExportSelected(photo.id, e);
+            else onExport(e);
+          }}
           title={selected && selected.size > 0 ? `Export ${selected.size} selected photos` : "Export this photo"}
         >
           {I.export} Export{selected && selected.size > 0 ? ` ${selected.size}` : ""}
@@ -1824,7 +3563,19 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
         className={`stage ${anim ? "anim" : ""}`}
         ref={stageRef}
         onPointerDown={startDrag("pan")}
-        onDoubleClick={() => rect && view && refit(rect, view, true)}
+        onDoubleClick={() => {
+          if (!view) return;
+          // in crop mode, .cropframe's own onDoubleClick (fit-to-crop-area)
+          // stops propagation before this fires — reaching here means the
+          // double-click landed outside the crop selection, so zoom out to
+          // the whole original photo instead (zoomToWholePhoto leaves the
+          // crop selection itself untouched — see its own comment above).
+          if (mode === "crop") {
+            zoomToWholePhoto();
+            return;
+          }
+          if (rect) refit(rect, view, true);
+        }}
         onContextMenu={(e) => {
           if (!onContextExport) return;
           e.preventDefault();
@@ -1840,19 +3591,19 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
               transform: `translate(${view.icx - iw / 2}px, ${view.icy - ih / 2}px) rotate(${theta}deg) scale(${view.k})`,
             }}
           >
-            <img className="base" src={proxyURL(photo)} alt="" draggable={false} />
+            <GLImage className="base" src={editSrcURL(photo)} adjust={adjust} draggable={false} />
             {tile && (
-              <img
+              <GLImage
                 className="tileimg"
                 src={tile.url}
-                alt=""
+                adjust={adjust}
                 draggable={false}
                 style={{ left: tile.sx, top: tile.sy, width: tile.sw, height: tile.sh, opacity: tile.fading ? 0 : 1 }}
               />
             )}
           </div>
         )}
-        {rect && view && mode === "view" && (
+        {rect && view && (mode === "view" || mode === "stamp") && (
           <div
             className="viewclip"
             style={{ left: rect.x, top: rect.y, width: rect.w, height: rect.h }}
@@ -1864,17 +3615,50 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
                 transform: `translate(${view.icx - rect.x - iw / 2}px, ${view.icy - rect.y - ih / 2}px) rotate(${theta}deg) scale(${view.k})`,
               }}
             >
-              <img className="base" src={proxyURL(photo)} alt="" draggable={false} />
+              <GLImage
+                className="base"
+                src={editSrcURL(photo)}
+                adjust={adjust}
+                stamp={stamp}
+                draft={mode === "stamp" ? draft : null}
+                texRegion={baseTexRegion}
+                draggable={false}
+              />
               {tile && (
-                <img
+                <GLImage
                   className="tileimg"
                   src={tile.url}
-                  alt=""
+                  adjust={adjust}
+                  stamp={stamp}
+                  draft={mode === "stamp" ? draft : null}
+                  texRegion={tileTexRegion}
                   draggable={false}
                   style={{ left: tile.sx, top: tile.sy, width: tile.sw, height: tile.sh, opacity: tile.fading ? 0 : 1 }}
                 />
               )}
             </div>
+            {mode === "stamp" && (
+              <StampOverlay
+                stamp={stamp}
+                setStamp={setStamp}
+                draft={draft}
+                setDraft={setDraft}
+                selectedStroke={selectedStroke}
+                setSelectedStroke={setSelectedStroke}
+                snapshot={snapshot}
+                view={view}
+                rect={rect}
+                iw={iw}
+                ih={ih}
+                stageRef={stageRef}
+                toast={toast}
+                brushRadius={brushRadius}
+                feather={feather}
+                opacity={stampOpacity}
+                gesturing={gesturing}
+                editPixelsRef={editPixelsRef}
+              />
+            )}
           </div>
         )}
         {rect && mode === "crop" && (
@@ -1882,8 +3666,23 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
             className={`cropframe ${drag.current?.mode === "image" ? "grabbing" : ""}`}
             style={{ left: rect.x, top: rect.y, width: rect.w, height: rect.h }}
             onPointerDown={startDrag("image")}
+            onDoubleClick={(e) => {
+              e.stopPropagation(); // otherwise bubbles to .stage's own onDoubleClick below, which fits the whole photo instead
+              // animate=false: an animated refit here is a big, frequent
+              // enough scale jump that a second quick double-click (e.g.
+              // trying the crop-area vs. empty-area behaviors back to back)
+              // fires cancelFlip() while the first flip's CSS transition is
+              // still mid-flight, which snaps .world's transform straight to
+              // "none" on top of a half-finished transition — freezing the
+              // crop frame at a wrong intermediate size/position instead of
+              // its correct final one, which reads as "the crop reset".
+              // Snapping instantly (matching how wheel-zoom already always
+              // works, with no animation at all) removes that window
+              // entirely.
+              if (view) refit(rect, view, false);
+            }}
           >
-            <div className={`thirds ${interacting ? "on" : ""}`}>
+            <div className="thirds">
               <div className="v" style={{ left: "33.333%" }} />
               <div className="v" style={{ left: "66.666%" }} />
               <div className="h" style={{ top: "33.333%" }} />
@@ -1901,7 +3700,10 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
         )}
         </div>
       </div>
-      <MetaPanel photo={photo} outW={outW} outH={outH} theta={theta} onRate={onRate} exif={exif} />
+      <div className="meta">
+        <DevelopPanel photo={photo} iw={iw} ih={ih} crop={histCrop} adjust={adjust} onAdjustChange={setAdjust} onSliderStart={snapshot} />
+        <MetaPanel photo={photo} outW={outW} outH={outH} theta={theta} exif={exif} />
+      </div>
       </div>
 
       {mode === "crop" && (
@@ -1969,15 +3771,115 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
       </div>
       )}
 
-      <Filmstrip
-        items={siblings}
-        currentId={photo.id}
-        onSelect={switchTo}
-        selectedIds={selected}
-        onToggleSel={onToggleSel}
-        onRangeSel={onRangeSel}
-        onContext={onContextExport}
-      />
+      {mode === "stamp" && (
+      <div className="toolbelt">
+        <div className="rot-row">
+          <span style={{ color: "var(--muted)", fontSize: 13 }}>Brush size</span>
+          <div className="rot-slider">
+            <input
+              type="range"
+              className="rot"
+              min={Math.max(2, Math.round(Math.min(iw, ih) * 0.0012))}
+              max={Math.round(Math.min(iw, ih) * 0.15)}
+              step={1}
+              value={brushRadius}
+              onChange={(e) => setBrushRadius(parseFloat(e.target.value))}
+            />
+          </div>
+          <div className="degree">{Math.round(brushRadius)}px</div>
+        </div>
+        <div className="rot-row">
+          <span style={{ color: "var(--muted)", fontSize: 13 }}>
+            Feather{selectedStroke != null ? " (selected)" : ""}
+          </span>
+          <div className="rot-slider">
+            <input
+              type="range"
+              className="rot"
+              min={0}
+              max={80}
+              step={1}
+              value={Math.round((selectedStroke != null ? stamp[selectedStroke].feather : feather) * 100)}
+              onPointerDown={snapshot}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value) / 100;
+                if (selectedStroke != null) {
+                  setStamp((prev) => prev.map((s, i) => (i === selectedStroke ? { ...s, feather: v } : s)));
+                } else {
+                  setFeather(v);
+                }
+              }}
+            />
+          </div>
+          <div className="degree">
+            {Math.round((selectedStroke != null ? stamp[selectedStroke].feather : feather) * 100)}%
+          </div>
+        </div>
+        <div className="rot-row">
+          <span style={{ color: "var(--muted)", fontSize: 13 }}>
+            Opacity{selectedStroke != null ? " (selected)" : ""}
+          </span>
+          <div className="rot-slider">
+            <input
+              type="range"
+              className="rot"
+              min={10}
+              max={100}
+              step={1}
+              value={Math.round((selectedStroke != null ? stamp[selectedStroke].opacity : stampOpacity) * 100)}
+              onPointerDown={snapshot}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value) / 100;
+                if (selectedStroke != null) {
+                  setStamp((prev) => prev.map((s, i) => (i === selectedStroke ? { ...s, opacity: v } : s)));
+                } else {
+                  setStampOpacity(v);
+                }
+              }}
+            />
+          </div>
+          <div className="degree">
+            {Math.round((selectedStroke != null ? stamp[selectedStroke].opacity : stampOpacity) * 100)}%
+          </div>
+        </div>
+      </div>
+      )}
+
+      {siblings && siblings.length >= 2 && (
+        <>
+          <div
+            className="filmstrip-resize"
+            onPointerDown={(e) => {
+              e.preventDefault();
+              const startY = e.clientY;
+              const startH = filmstripHeight;
+              const move = (ev) => {
+                // dragging UP (toward smaller clientY) grows the panel — the
+                // handle sits on the panel's TOP edge, same convention as
+                // dragging a window's own top edge to make it taller.
+                const dy = startY - ev.clientY;
+                onFilmstripResize(clamp(startH + dy, FILMSTRIP_MIN_H, FILMSTRIP_MAX_H));
+              };
+              const up = () => {
+                window.removeEventListener("pointermove", move);
+                window.removeEventListener("pointerup", up);
+              };
+              window.addEventListener("pointermove", move);
+              window.addEventListener("pointerup", up, { once: true });
+            }}
+          />
+          <Filmstrip
+            items={siblings}
+            currentId={photo.id}
+            onSelect={switchTo}
+            selectedIds={selected}
+            onToggleSel={onToggleSel}
+            onRangeSel={onRangeSel}
+            onContext={onContextExport}
+            height={filmstripHeight}
+          />
+        </>
+      )}
     </div>
   );
 }
@@ -1985,7 +3887,7 @@ function Editor({ photo, siblings, onClose, onApply, onSwitch, onExport, onExpor
 /* ============================================================
    EXPORT DIALOG
    ============================================================ */
-function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, toast }) {
+function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, onExportNative, toast }) {
   const [format, setFormat] = useState("jpeg");
   const [targetMB, setTargetMB] = useState("2");
   const [scale, setScale] = useState(100);
@@ -2067,22 +3969,18 @@ function ExportDialog({ items, onClose, onSavePreset, presets, onRunPreset, toas
   };
 
   const doExport = async () => {
+    if (NATIVE && items.every((it) => it.photo.path)) {
+      // hand off to the app-level runner and close immediately — the actual
+      // export continues in the background, progress shown in the
+      // persistent top-bar indicator instead of blocking this dialog
+      const serial = items.map((it) => ({ path: it.photo.path, name: it.photo.name, edits: it.edits }));
+      onClose();
+      onExportNative(serial, { format, targetMB: targetMBn, scale, template, keepExif });
+      return;
+    }
+
     setExporting(true);
     try {
-      if (NATIVE && items.every((it) => it.photo.path)) {
-        setProgress("Exporting…");
-        const serial = items.map((it) => ({ path: it.photo.path, name: it.photo.name, edits: it.edits }));
-        const res = await window.meridian.exportPhotos(serial, {
-          format, targetMB: targetMBn, scale, dir: null, template, keepExif,
-        });
-        if (res.canceled) { setExporting(false); setProgress(null); return; }
-        toast(items.length > 1
-          ? `Exported ${res.exported}${res.failed ? `, ${res.failed} failed` : ""}`
-          : "Photo exported");
-        onClose();
-        return;
-      }
-
       /* browser fallback: canvas pipeline + downloads */
       const ext = format === "jpeg" ? "jpg" : "webp";
       const prepared = [];
@@ -2293,6 +4191,11 @@ function Thumb({ src, alt }) {
   );
 }
 
+const FILMSTRIP_MIN_H = 92;   // = the previous fixed height, kept as the floor
+const FILMSTRIP_MAX_H = 184;  // 2× the floor — "adequate limits", not half the screen
+const SIDEBAR_MIN_W = 208;    // = the previous fixed width, kept as the floor — long folder names still ellipsize below this, same as before
+const SIDEBAR_MAX_W = 416;    // 2× the floor, same "adequate limits" reasoning as the filmstrip
+
 /* ============================================================
    APP
    ============================================================ */
@@ -2311,6 +4214,8 @@ export default function App() {
   const [watchedRoots, setWatchedRoots] = useState([]);
   const [theme, setTheme] = useState("dark");
   const [presets, setPresets] = useState([]);      // export presets {id,name,format,targetMB,scale,dir}
+  const [filmstripHeight, setFilmstripHeight] = useState(FILMSTRIP_MIN_H); // persisted like theme — see the settings load/save effects below
+  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_MIN_W);         // persisted the same way — see the settings load/save effects below
   const [ctxMenu, setCtxMenu] = useState(null);    // {x, y, ids}
   const [minRating, setMinRating] = useState(0);   // sidebar rating filter
   const [busyExport, setBusyExport] = useState(null);
@@ -2318,14 +4223,43 @@ export default function App() {
   const folderInput = useRef(null);
   const dragCount = useRef(0);
   const toastTimer = useRef(null);
+  const busyExportTimer = useRef(null);
   const loadedOnce = useRef(false);
   const photosRef = useRef([]);
   useEffect(() => { photosRef.current = photos; }, [photos]);
+
+  /* A <button> clicked with a mouse otherwise keeps DOM focus afterward —
+     visually a distracting ring around whatever was last clicked (Reset,
+     a library sidebar folder, ...), and functionally worse: a focused
+     button intercepts Space/Enter and re-fires its own click, so an
+     unrelated later keypress (e.g. Space, used elsewhere as a shortcut)
+     can silently re-trigger it. preventDefault on mousedown stops a
+     button from ever taking focus on a mouse click in the first place —
+     the click itself still fires normally, and Tab-based keyboard
+     navigation is untouched (this only intercepts mouse-originated
+     mousedown). One listener here covers every button in the app, rather
+     than needing this on each one individually. */
+  useEffect(() => {
+    const onMouseDown = (e) => {
+      if (e.target.closest("button")) e.preventDefault();
+    };
+    window.addEventListener("mousedown", onMouseDown);
+    return () => window.removeEventListener("mousedown", onMouseDown);
+  }, []);
 
   const toast = useCallback((msg, action = null, ttl = 2600) => {
     setToastMsg(msg ? { text: msg, action } : null);
     clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(() => setToastMsg(null), action ? Math.max(ttl, 6000) : ttl);
+  }, []);
+
+  /* shows a result message (e.g. "Photo exported") in the same top-bar slot
+     export progress already uses, instead of the bottom toast — so export
+     feedback stays where the user was already looking, then clears itself */
+  const flashBusy = useCallback((msg, ttl = 2600) => {
+    clearTimeout(busyExportTimer.current);
+    setBusyExport(msg);
+    busyExportTimer.current = setTimeout(() => setBusyExport(null), ttl);
   }, []);
 
   const undoRemoval = useCallback(async (removedPhotos, roots) => {
@@ -2356,6 +4290,8 @@ export default function App() {
       })));
       if (settings?.theme === "light") setTheme("light");
       if (Array.isArray(settings?.exportPresets)) setPresets(settings.exportPresets);
+      if (typeof settings?.filmstripHeight === "number") setFilmstripHeight(clamp(settings.filmstripHeight, FILMSTRIP_MIN_H, FILMSTRIP_MAX_H));
+      if (typeof settings?.sidebarWidth === "number") setSidebarWidth(clamp(settings.sidebarWidth, SIDEBAR_MIN_W, SIDEBAR_MAX_W));
       setWatchedRoots(roots || []);
       setLibLoaded(true);
       if (missing > 0) toast(`${missing} photo${missing > 1 ? "s" : ""} removed — files no longer on disk`);
@@ -2426,10 +4362,10 @@ export default function App() {
     const t = setTimeout(() => {
       // previewUrl is a blob: URL scoped to this session — dead on restart
       const serializable = photos.map(({ url, previewUrl, ...rest }) => rest);
-      window.meridian.saveLibrary(serializable, { theme, exportPresets: presets });
+      window.meridian.saveLibrary(serializable, { theme, exportPresets: presets, filmstripHeight, sidebarWidth });
     }, 400);
     return () => clearTimeout(t);
-  }, [photos, libLoaded, theme, presets]);
+  }, [photos, libLoaded, theme, presets, filmstripHeight, sidebarWidth]);
 
   /* ---- import: native records [{path, name, folder}] ---- */
   const addNativeRecords = useCallback(async (records) => {
@@ -2662,6 +4598,7 @@ export default function App() {
         );
         const edits = { theta: a, qcx: 0, qcy: 0, cw: p.w / f, ch: p.h / f };
         const preview = await bakePreview(src, p.w, p.h, edits, 560);
+        cachePreviewToDisk(p.path, preview);
         setPhotos((prev) => prev.map((x) => (x.id === id ? { ...x, edits, previewUrl: preview } : x)));
         fixed++;
       } catch {}
@@ -2717,12 +4654,34 @@ export default function App() {
         template: preset.template || "{name}", keepExif: !!preset.keepExif,
       });
       if (res.ok) {
-        toast(`"${preset.name}": exported ${res.exported}${res.failed ? `, ${res.failed} failed` : ""} → ${baseName(res.dir)}`);
+        flashBusy(`"${preset.name}": exported ${res.exported}${res.failed ? `, ${res.failed} failed` : ""} → ${baseName(res.dir)}`);
+      } else {
+        setBusyExport(null);
       }
-    } finally {
+    } catch {
       setBusyExport(null);
     }
-  }, [serializeItems, toast]);
+  }, [serializeItems, flashBusy]);
+
+  /* fires from ExportDialog's Export button, which closes itself immediately
+     — this runs the actual native export in the background, independent of
+     the (by-then-unmounted) dialog, with progress surfaced through the same
+     persistent busyExport indicator runPreset above already uses */
+  const runExport = useCallback(async (serial, opts) => {
+    setBusyExport(serial.length > 1 ? `Exporting ${serial.length}…` : "Exporting…");
+    try {
+      const res = await window.meridian.exportPhotos(serial, {
+        format: opts.format, targetMB: opts.targetMB, scale: opts.scale, dir: null,
+        template: opts.template, keepExif: opts.keepExif,
+      });
+      if (res.canceled) { setBusyExport(null); return; }
+      flashBusy(serial.length > 1
+        ? `Exported ${res.exported}${res.failed ? `, ${res.failed} failed` : ""}`
+        : "Photo exported");
+    } catch {
+      setBusyExport(null);
+    }
+  }, [flashBusy]);
 
   const savePreset = useCallback(async (draft) => {
     const dir = await window.meridian.pickDir();
@@ -2760,8 +4719,16 @@ export default function App() {
     setExportItems([{ photo: editingPhoto, edits: liveEdits }]);
   };
 
-  const exportSelected = () => {
-    const items = photos.filter((p) => selected.has(p.id)).map((p) => ({ photo: p, edits: p.edits }));
+  /* overrideId/overrideEdits: the Editor's Export button calls onApply()
+     (an async setPhotos) immediately before this — since that update isn't
+     flushed yet, `photos` here would still hold the pre-edit version of
+     whichever photo is currently open. The override lets that one call site
+     hand over the edits it just computed directly, instead of this reading
+     stale state a render behind. */
+  const exportSelected = (overrideId, overrideEdits) => {
+    const items = photos
+      .filter((p) => selected.has(p.id))
+      .map((p) => ({ photo: p, edits: p.id === overrideId ? overrideEdits : p.edits }));
     if (items.length) setExportItems(items);
   };
 
@@ -2833,7 +4800,7 @@ export default function App() {
       <style>{CSS}</style>
 
       <div className="topbar">
-        <div className="brand"><span className="dot" /><span className="name">SPLICER</span></div>
+        <div className="brand"><span className="dot" /><span className="name">SPLICER LAB</span></div>
         <button className="btn" onClick={importPhotos}>{I.upload} Import photos</button>
         <button className="btn" onClick={importFolder}>{I.folder} Import folder</button>
         {!NATIVE && (
@@ -2869,7 +4836,7 @@ export default function App() {
               <>
                 <span style={{ color: "var(--muted)", fontSize: 13 }}>{selected.size} selected</span>
                 <button className="btn" onClick={batchLevel} title="Auto-level all selected photos">{I.level} Level</button>
-                <button className="btn" onClick={exportSelected}>{I.export} Export</button>
+                <button className="btn" onClick={() => exportSelected()}>{I.export} Export</button>
                 <button className="btn danger" onClick={deleteSelected}>{I.trash} Remove</button>
                 <button className="btn ghost" onClick={clearSelection}>Cancel</button>
               </>
@@ -2883,14 +4850,14 @@ export default function App() {
       </div>
 
       <div className="body">
-        <div className="sidebar">
+        <div className="sidebar" style={{ width: sidebarWidth }}>
           <button className={`side-item ${activeFolder === "__all__" ? "active" : ""}`} onClick={() => setActiveFolder("__all__")}>
             {I.photos} All Photos <span className="count">{photos.length}</span>
           </button>
           <button className={`side-item ${activeFolder === "__edited__" ? "active" : ""}`} onClick={() => setActiveFolder("__edited__")}>
             {I.level} Edited <span className="count">{photos.filter((p) => p.edits).length}</span>
           </button>
-          <div className="side-label">Rating</div>
+          <div className="side-label">Sort by rating</div>
           <div className="side-rating">
             {[1, 2, 3, 4, 5].map((n) => (
               <button
@@ -2933,6 +4900,25 @@ export default function App() {
             );
           })}
         </div>
+
+        <div
+          className="sidebar-resize"
+          onPointerDown={(e) => {
+            e.preventDefault();
+            const startX = e.clientX;
+            const startW = sidebarWidth;
+            const move = (ev) => {
+              const dx = ev.clientX - startX; // dragging right grows the sidebar
+              setSidebarWidth(clamp(startW + dx, SIDEBAR_MIN_W, SIDEBAR_MAX_W));
+            };
+            const up = () => {
+              window.removeEventListener("pointermove", move);
+              window.removeEventListener("pointerup", up);
+            };
+            window.addEventListener("pointermove", move);
+            window.addEventListener("pointerup", up, { once: true });
+          }}
+        />
 
         <div className="main">
           {photos.length === 0 ? (
@@ -3016,6 +5002,8 @@ export default function App() {
           onContextExport={NATIVE ? openContextMenu : null}
           onRate={setRating}
           toast={toast}
+          filmstripHeight={filmstripHeight}
+          onFilmstripResize={setFilmstripHeight}
         />
       )}
 
@@ -3030,6 +5018,7 @@ export default function App() {
             setExportItems(null);
             runPreset(pr, ids);
           }}
+          onExportNative={runExport}
           toast={toast}
         />
       )}

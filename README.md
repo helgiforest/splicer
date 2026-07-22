@@ -1,25 +1,28 @@
-# Splicer
+# Splicer Lab
 
-**A focused photo tool: library, precision crop, automatic horizon leveling, and size-targeted export.**
+**A fast, fully local photo editor** — library, non-destructive develop tools, precision crop with auto horizon leveling, clone stamp retouching, and size-targeted export. One app, no bloat, nothing leaves your machine.
 
-Splicer does a few things and does them properly. It doesn't try to replace a full editor — it's built for the workflow of *straighten → crop → export at exactly the file size you need*, with a real photo library underneath.
+![Splicer Lab](https://img.shields.io/badge/version-3.0.0-f3c34f) ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-1c1f26)
 
-![Splicer](https://img.shields.io/badge/version-2.3.0-f3c34f) ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-1c1f26)
+---
+
+## Philosophy
+
+Splicer Lab does a few things and does them properly, instead of trying to be everything. A real photo library, a proper develop module (exposure, color, highlights & shadows, with a live crop-aware histogram), a precision crop with auto horizon leveling, a clone stamp for retouching, and export that hits an exact file size — that's the whole app. No accounts, no cloud processing, no telemetry: everything runs 100% locally, and your photos never leave your computer.
 
 ---
 
 ## Features
 
-- **Photo library** that mirrors your real folders — import a folder once and it stays in sync with the disk automatically (add or remove files in Explorer/Finder and the library follows, even while the app is closed). Filter by star rating, an "Edited" view, or a specific folder; sort by date and resize thumbnails on the fly. Multi-select with `Ctrl`/`Shift`-click for batch level, batch export, or batch remove. Originals are **never modified** — every edit is non-destructive and reversible, and removing something from the library never deletes it from disk (there's a one-click Undo in the toast either way).
-- **Precision crop**: aspect presets (Free, Original, 1:1, 3:2, 4:3, 16:9, 4:5 — flip any of them to their portrait/landscape counterpart), rule-of-thirds grid, quarter-turn rotation (`[` `]`) plus a fine ±45° leveling slider with auto-fill, hand tool, canvas zoom with deep-zoom sharpening for pixel-precise framing, full undo/redo history (`Ctrl+Z` / `Ctrl+Shift+Z`).
-- **Auto horizon leveling** built on line detection (Hough transform ranked by line length) — one click, with alternative suggestions if the first guess is off, and a batch mode that levels a whole selection at once.
-- **Size-targeted export**: type "9 MB" and Splicer binary-searches the encoder to land just under it. Powered by **MozJPEG** (best-in-class quality per byte) and high-effort WebP, with a live size estimate before you save — instant even on huge files, since the search runs on a downscaled preview and the result is scaled back up.
-- **Export presets**: save "Telegram · ≤2 MB · JPEG → D:\Out" once, then right-click any photo(s) → one click and they're compressed and delivered to that folder. Filename templates (`{name}`, `{date}`) and optional EXIF carry-over included.
-- **Big-file ready**: a proxy pyramid keeps 200-megapixel files panning and zooming as smoothly as phone photos, with on-demand full-resolution tiles the moment you zoom in past the proxy's own sharpness.
-- **Wide format support**: JPEG, PNG, WebP, GIF, AVIF, BMP, TIFF, HEIC/HEIF and camera RAW (CR2, CR3, NEF, ARW, ORF, RW2, RAF, DNG, PEF and more).
-- Star ratings with keyboard shortcuts, an EXIF panel (camera, lens, ISO, shutter speed, aperture, focal length, capture date), dark & light themes, drag-and-drop import straight from the OS.
-
-Everything runs **100% locally**. No accounts, no cloud, no telemetry — your photos never leave your computer.
+- **Photo library** that mirrors your real folders — import once and it stays in sync with disk, even while the app is closed. Filter by rating, an "Edited" view, or folder; multi-select for batch level, export, or remove. Originals are **never modified**; every edit is non-destructive.
+- **Develop module**: Temperature, Tint, Saturation, Exposure, Contrast, Highlights, Shadows, Black/White point — all live, all reversible. A real-time histogram reflects the current crop and shows red clipping bars when the black or white point pushes pixels past 0% or 100%.
+- **Clone Stamp**: paint from any source point to remove or duplicate detail, with automatic color/tone matching so patches blend in instead of leaving a visible seam. Fully non-destructive — edit it again anytime.
+- **Precision crop**: aspect presets (Free, Original, 1:1, 3:2, 4:3, 16:9, 4:5, flip any of them), rule-of-thirds grid, quarter-turn rotation, a fine ±45° leveling slider, deep-zoom sharpening for pixel-precise framing, full undo/redo.
+- **Auto horizon leveling** via Hough-transform line detection — one click, with alternative angles if the first guess is off, and a batch mode for a whole selection at once.
+- **Size-targeted export**: type "9 MB" and Splicer Lab binary-searches the encoder to land just under it. MozJPEG and high-effort WebP, with a live estimate before you save. Save reusable **export presets** (size, format, destination folder) for one-click batch export.
+- **Big files welcome**: a proxy pyramid keeps 200-megapixel files smooth to pan and zoom, with on-demand full-resolution tiles the moment you zoom in past the proxy.
+- **Wide format support**: JPEG, PNG, WebP, GIF, AVIF, BMP, TIFF, HEIC/HEIF, and camera RAW (CR2, CR3, NEF, ARW, ORF, RW2, RAF, DNG, PEF and more).
+- Star ratings, an EXIF panel, dark & light themes, drag-and-drop import, a resizable filmstrip and library sidebar that remember their size.
 
 ---
 
@@ -29,62 +32,68 @@ Grab the file for your system from the **[latest release](../../releases/latest)
 
 | System | File | Notes |
 |---|---|---|
-| **Windows 10/11** | `Splicer Setup X.X.X.exe` | Regular installer |
-| **macOS — Apple Silicon** | `Splicer-X.X.X-arm64.dmg` | |
-| **Linux** | `Splicer-X.X.X.AppImage` | No installation needed |
+| **Windows 10/11** | `Splicer Lab Setup X.X.X.exe` | Regular installer |
+| **macOS — Apple Silicon** | `Splicer Lab-X.X.X-arm64.dmg` | |
+| **Linux** | `Splicer Lab-X.X.X.AppImage` | No installation needed |
 
-The app is not code-signed with a paid certificate, so each OS shows a one-time warning on first launch. This is expected — here's how to get past it:
+The app isn't code-signed with a paid certificate, so each OS shows a one-time warning on first launch — this is expected:
 
-### Windows
-1. Run the `.exe`. If **SmartScreen** appears ("Windows protected your PC"): click **More info → Run anyway**.
-2. Follow the installer. Launch Splicer from the Start menu.
+**Windows** — if SmartScreen appears: **More info → Run anyway**.
 
-### macOS
-1. Open the `.dmg` and drag **Splicer** into **Applications**.
-2. First launch: **right-click the app → Open → Open** (a plain double-click will be blocked once).
-3. If macOS says the app *"is damaged and can't be opened"* — it isn't damaged, it's the quarantine flag on unsigned downloads. Open **Terminal** and run:
-   ```
-   xattr -cr /Applications/Splicer.app
-   ```
-   then launch normally.
-
-### Linux
+**macOS** — first launch: **right-click the app → Open → Open** (a plain double-click is blocked once). If it says the app *"is damaged"*, that's the quarantine flag on unsigned downloads, not real damage:
 ```bash
-chmod +x Splicer-*.AppImage
-./Splicer-*.AppImage
+xattr -cr "/Applications/Splicer Lab.app"
 ```
-If it complains about FUSE: `sudo apt install libfuse2`.
+
+**Linux**
+```bash
+chmod +x "Splicer Lab"*.AppImage
+./"Splicer Lab"*.AppImage
+```
+FUSE error? `sudo apt install libfuse2`.
 
 ---
 
-## Quick start
+## Usage guide
 
-1. **Import folder** — pick a folder of photos; it appears in the sidebar and stays in sync with the disk.
-2. Click a photo → it opens in the **viewer**. Press **Crop** (or `Enter`) for the tools.
-3. Hit **Auto level**, fine-tune with the slider or the suggested alternatives, adjust the frame, press **Done** (`Enter`).
-4. **Export** → set the max size in MB, watch the live estimate, save. Or create a **preset** and from then on just right-click photo(s) → one click.
+### Quick start
 
-For a batch of photos: `Ctrl`/`Shift`-click to select several in the library grid, then use **Level**, **Export**, or **Remove** in the toolbar that appears.
+1. **Import a folder** — it appears in the sidebar and stays in sync with disk.
+2. Click a photo to open the viewer.
+3. **Crop**: press `Enter` or click Crop, hit **Auto level**, adjust the frame, `Enter` to apply.
+4. **Develop**: adjust sliders in the right-hand panel — changes are live and non-destructive. Double-click any slider to reset it to 0.
+5. **Retouch**: press `S` for the Clone Stamp, drag to paint over what you want gone.
+6. **Export**: set a target size in MB and watch the live estimate, or use a saved preset for one click.
+
+### Working the canvas
+
+- **Mouse wheel** zooms in and out on the point under your cursor.
+- **Double-click** empty space to fit the whole photo/crop to the window — the fast way back out after zooming in for detail work.
+- **Drag** empty space to pan. Hold **Space** for a temporary pan tool while another tool (e.g. Clone Stamp) is active.
+- The **bottom filmstrip** and **left sidebar** can be resized by dragging their edge — the size is remembered next time you open the app.
 
 ### Keyboard shortcuts
 
 | Key | Action |
 |---|---|
-| `Enter` | Open crop tools / apply crop |
+| `Enter` | Apply current edits (crop + develop + clone stamp) |
 | `Esc` | Apply & return to library |
 | `←` `→` | Previous / next photo |
-| `[` `]` | Rotate crop frame 90° left / right |
-| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo crop steps |
+| `[` `]` | Rotate crop frame 90° (in Crop) |
+| `S` | Open the Clone Stamp tool |
+| `[` `]`, `+` `-` | Shrink / grow the clone stamp brush (while the tool is open) |
+| Double-click a stroke | Delete that clone stamp stroke |
+| `Delete` / `Backspace` | Delete the selected clone stamp stroke |
+| `Space` (hold) | Temporary pan tool |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | `1`–`5`, `0` | Rate photo / clear rating |
-| Mouse wheel | Zoom the canvas |
-| Drag empty space | Pan · double-click to fit the frame to the window |
-| `Ctrl+Click`, `Shift+Click` | Select photos / select a range |
+| `Ctrl+Click`, `Shift+Click` | Select photos / select a range (library) |
 
 ### Good to know
 
-- **Removing photos or folders from the library never deletes files from disk** — and there's an Undo button in the toast just in case.
-- Deep-zoomed view sharpens to true 1:1 pixels a moment after you stop zooming — that's the tile engine catching up with the proxy.
-- If the export estimate says *"Maximum quality reached"*, your size limit is generous: quality 100 is already smaller than the limit, and extra bytes wouldn't add detail.
+- Removing photos or folders from the library **never deletes files from disk** — there's an Undo in the toast either way.
+- A deep-zoomed view sharpens to true 1:1 pixels a moment after you stop zooming — that's the full-resolution tile catching up with the proxy.
+- If export says *"Maximum quality reached"*, your size limit is generous enough that quality 100 already fits under it.
 
 ---
 
@@ -93,8 +102,8 @@ For a batch of photos: `Ctrl`/`Shift`-click to select several in the library gri
 Requires [Node.js](https://nodejs.org) 18+.
 
 ```bash
-git clone https://github.com/helgiforest/splicer.git
-cd splicer
+git clone https://github.com/helgiforest/splicer-lab.git
+cd splicer-lab
 npm install
 npm start          # build & run
 npm run dist       # create the installer for your OS in release/

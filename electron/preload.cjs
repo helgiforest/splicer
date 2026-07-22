@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld("meridian", {
   unwatchRoot: (root) => ipcRenderer.invoke("unwatch-root", root),
   loadLibrary: () => ipcRenderer.invoke("load-library"),
   saveLibrary: (items, settings) => ipcRenderer.invoke("save-library", items, settings),
+  cacheEditPreview: (filePath, dataUrl) => ipcRenderer.invoke("cache-edit-preview", filePath, dataUrl),
   exportFiles: (files) => ipcRenderer.invoke("export-files", files),
   estimatePhoto: (item, opts) => ipcRenderer.invoke("estimate-photo", item, opts),
   exportPhotos: (items, opts) => ipcRenderer.invoke("export-photos", items, opts),
